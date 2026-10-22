@@ -85,6 +85,16 @@ Key names use xdotool syntax: `Return`, `Escape`, `Tab`, `BackSpace`, `Delete`, 
 - Don't type the user's real passwords, tokens or payment details into apps in the container unless the user asks you to in this conversation.
 - Get confirmation before purchases, sending messages, or other irreversible actions that a GUI app might take on the user's behalf.
 
+## Audit log and recording
+
+Every action is logged in the container, with source, arguments, result, active window and a screenshot taken just after it. Don't try to avoid or edit the log. Typed text is logged only as its length by default, but screenshots still show text that is visible on screen.
+
+```bash
+ccu record start            # when the user asks for a video; ccu record stop prints the .mp4 path
+ccu audit export            # copies the log, screenshots and an HTML timeline to the host; prints index.html
+ccu audit verify            # hash chain + host mirror check
+```
+
 ## MCP alternative
 
 The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.

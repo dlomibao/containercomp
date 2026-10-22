@@ -17,6 +17,8 @@ import sys
 import tempfile
 import time
 
+import ccu_audit as audit
+
 DISPLAY = os.environ.get("DISPLAY", ":1")
 SESSION_ENV = os.path.expanduser("~/.cache/ccu/session.env")
 LAUNCH_LOG_DIR = os.path.expanduser("~/.cache/ccu/launch")
@@ -56,6 +58,7 @@ def xdotool(*args):
 
 # --- observation -----------------------------------------------------------
 
+@audit.audited("observation", name="screenshot")
 def screenshot_png(cursor=True):
     """Return the full screen as PNG bytes."""
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -71,6 +74,7 @@ def screenshot_png(cursor=True):
         os.unlink(path)
 
 
+@audit.audited("observation", name="zoom")
 def zoom_png(x0, y0, x1, y1, scale=2.0):
     """Crop a region of the screen and enlarge it, for reading small text."""
     from PIL import Image
@@ -116,10 +120,12 @@ def active_window():
 
 # --- actions -----------------------------------------------------------------
 
+@audit.audited()
 def move(x, y):
     xdotool("mousemove", "--sync", x, y)
 
 
+@audit.audited()
 def click(x=None, y=None, button="left", count=1, modifiers=None):
     if button not in BUTTONS:
         raise CuError(f"unknown button {button!r}; use left, middle or right")
@@ -135,14 +141,17 @@ def click(x=None, y=None, button="left", count=1, modifiers=None):
             xdotool("keyup", m)
 
 
+@audit.audited()
 def mouse_down(button="left"):
     xdotool("mousedown", BUTTONS[button])
 
 
+@audit.audited()
 def mouse_up(button="left"):
     xdotool("mouseup", BUTTONS[button])
 
 
+@audit.audited()
 def drag(x0, y0, x1, y1, button="left", steps=10):
     move(x0, y0)
     mouse_down(button)
@@ -154,6 +163,7 @@ def drag(x0, y0, x1, y1, button="left", steps=10):
         mouse_up(button)
 
 
+@audit.audited()
 def scroll(x, y, direction="down", amount=3):
     if direction not in SCROLL_BUTTONS:
         raise CuError(f"unknown direction {direction!r}; use up, down, left or right")
@@ -161,6 +171,7 @@ def scroll(x, y, direction="down", amount=3):
     xdotool("click", "--repeat", amount, "--delay", 30, SCROLL_BUTTONS[direction])
 
 
+@audit.audited(name="type", redact=("text",))
 def type_text(text, delay_ms=12):
     # Type line by line so newlines become real Return presses in every app.
     lines = text.split("\n")
@@ -171,11 +182,13 @@ def type_text(text, delay_ms=12):
             xdotool("key", "Return")
 
 
+@audit.audited()
 def key(*combos):
     """Press key combos in xdotool syntax, e.g. "ctrl+s", "Return", "alt+F4"."""
     xdotool("key", "--delay", 50, "--", *combos)
 
 
+@audit.audited()
 def launch(command):
     """Start a GUI command detached from this process; return (pid, log path)."""
     os.makedirs(LAUNCH_LOG_DIR, exist_ok=True)
@@ -194,6 +207,7 @@ def launch(command):
     return proc.pid, log
 
 
+@audit.audited()
 def focus(pattern):
     """Activate the first window whose title contains `pattern`."""
     proc = subprocess.run(["wmctrl", "-a", pattern], env=_env(), capture_output=True, text=True)
@@ -211,6 +225,10 @@ def wait_for_window(pattern, timeout=30.0):
     raise CuError(f"timed out after {timeout:g}s waiting for window matching {pattern!r}")
 
 
+# Let the audit log read the active window and reach the display.
+audit.window_title, audit.x_env, audit.screen_size = active_window, _env, screen_size
+
+
 # --- CLI -----------------------------------------------------------------------
 
 def _write_png(data, out):
@@ -224,6 +242,9 @@ def _write_png(data, out):
 
 
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv and argv[0] in ("exec", "record", "audit"):
+        return audit.main(argv)  # see ccu_audit.py
     p = argparse.ArgumentParser(prog="cu", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 

@@ -4,12 +4,16 @@ Runs inside the container over stdio. From the host:
 
     claude mcp add containercomp -- ccu mcp
 """
+import os
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, "/opt/ccu")
+# Tag audit log entries from this server (and from commands its shell tool runs).
+os.environ["CCU_AUDIT_SOURCE"] = "mcp"
 
+import ccu_audit as audit  # noqa: E402
 import cu  # noqa: E402
 from mcp.server.fastmcp import FastMCP, Image  # noqa: E402
 
@@ -140,13 +144,15 @@ def install(targets: list[str]) -> str:
     package name, a URL, or a path inside the container to a .deb, .AppImage,
     .exe/.msi (Wine, x86 image only), or archive. Files on the Mac host must be
     copied in first with `ccu install <host path>` instead."""
-    proc = subprocess.run(
-        ["sudo", "/usr/local/bin/ccu-install", *targets],
-        capture_output=True,
-        text=True,
-        timeout=1800,
-    )
-    tail = (proc.stdout + proc.stderr)[-4000:]
+    with audit.event("install", {"targets": targets}) as ev:
+        proc = subprocess.run(
+            ["sudo", "/usr/local/bin/ccu-install", *targets],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        tail = (proc.stdout + proc.stderr)[-4000:]
+        ev.update(ok=proc.returncode == 0, result={"exit": proc.returncode, "output": tail})
     return f"exit {proc.returncode}\n{tail}"
 
 
@@ -154,10 +160,12 @@ def install(targets: list[str]) -> str:
 def shell(command: str, timeout: float = 120.0) -> str:
     """Run a non-GUI shell command as the desktop user (use sudo for root). Use
     `launch` for GUI apps instead, since this waits for the command to exit."""
-    proc = subprocess.run(
-        ["bash", "-lc", command], capture_output=True, text=True, timeout=timeout, env=cu._env()
-    )
-    out = (proc.stdout + proc.stderr)[-8000:]
+    with audit.event("shell", {"command": command}) as ev:
+        proc = subprocess.run(
+            ["bash", "-lc", command], capture_output=True, text=True, timeout=timeout, env=cu._env()
+        )
+        out = (proc.stdout + proc.stderr)[-8000:]
+        ev.update(ok=proc.returncode == 0, result={"exit": proc.returncode, "output": out})
     return f"exit {proc.returncode}\n{out}"
 
 
