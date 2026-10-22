@@ -1,0 +1,20 @@
+#!/bin/bash
+# Remove runtime state left behind by a previous boot. A restarted container,
+# or one created from a snapshot (`ccu snapshot save` commits a live desktop),
+# still has the old X lock and sockets, D-Bus and session files on disk. A
+# stale /tmp/.X1-lock whose PID happens to match a new process makes Xvfb
+# refuse to start, and stale bus addresses point apps at dead sockets.
+# Runs as root from the entrypoint, before supervisord starts anything.
+shopt -s nullglob
+
+rm -f /tmp/.X[0-9]*-lock /tmp/.X11-unix/X[0-9]*
+rm -rf /tmp/.ICE-unix/* /tmp/.xfsm-ICE-* /tmp/dbus-* /tmp/pulse-* /tmp/ssh-*
+rm -f /run/supervisor.sock /run/supervisord.pid
+
+home=/home/user
+rm -rf "$home/.dbus/session-bus" "$home/.cache/at-spi" "$home/.ICEauthority"
+rm -f "$home"/.gnupg/S.*
+
+mkdir -p /tmp/.X11-unix /tmp/.ICE-unix
+chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix
+exit 0

@@ -77,7 +77,25 @@ Key names use xdotool syntax: `Return`, `Escape`, `Tab`, `BackSpace`, `Delete`, 
 - Read screenshots at most every action or two. Don't screenshot in tight loops; each one costs context.
 - For non-GUI work, such as reading files, checking processes or editing config, `ccu exec <cmd>` (or `ccu exec --root ...`) is faster and more reliable than driving a terminal window.
 - Move files between the Mac and the container with `ccu cp-in <host> [dest]` and `ccu cp-out <container path> [host dest]`. Container paths are relative to `/home/user`.
-- If the desktop looks wedged, check `ccu logs desktop`. `ccu down && ccu up` restarts it and keeps state. `ccu rm && ccu up` resets it to a clean image. Ask the user first, because `rm` discards everything installed.
+- If the desktop looks wedged, check `ccu logs desktop`. `ccu down && ccu up` restarts it and keeps state. `ccu reset` recreates it from the snapshot it came from, and `ccu reset --base` from the clean image. Both discard changes made since, so ask the user first unless they are covered by a snapshot or the user asked for a reset.
+
+## Snapshots and clean resets
+
+A snapshot saves the container's whole filesystem (installed apps, files, settings) as an image, so you can return to that exact state.
+
+```bash
+ccu snapshot save golden -m "app installed and configured"   # pauses the desktop for a second
+ccu snapshot list                    # * marks the snapshot the container came from
+ccu reset --from golden              # new container from the snapshot
+ccu reset                            # again from the same snapshot (see `ccu status`)
+ccu reset --base                     # back to the clean image
+```
+
+- **Before a risky change** (an untrusted installer, a big config change, an upgrade), save a snapshot first so it can be undone with `ccu reset --from NAME`.
+- **For repeatable tests**, set the app up once, save a snapshot, and run `ccu reset` before each test run so every run starts from the identical state. Report which snapshot you used.
+- Open windows aren't saved, only files. After a reset, launch the app again. If an app might be writing files, close it or save in it before you snapshot.
+- Names are letters, digits, `.`, `_` and `-`. `save` refuses to overwrite an existing name unless you pass `--force`.
+- **Ask the user before you delete a snapshot** (`ccu snapshot rm`) or overwrite one with `--force`. Snapshots may hold setup work that took them a long time. Saving snapshots, and resetting between test runs the user asked for, are fine without asking.
 
 ## Safety
 

@@ -28,15 +28,25 @@ usage: ccu [-t native|x86] <command> [args]
 
 Lifecycle
   build                 build (or rebuild) the image
-  up                    start the desktop (builds the image first if needed)
+  up [--from SNAP]      start the desktop (builds the image first if needed);
+                        --from creates the container from a snapshot
   down                  stop the container (state is kept)
   rm                    delete the container (state is lost; the image stays)
+  reset [--from SNAP | --base]
+                        recreate the container from the snapshot it came from
+                        (or another snapshot, or the base image) and start it
   status                show container status and the viewer URL
   open                  open the noVNC viewer in your browser
   logs [service]        desktop logs (xvfb, desktop, x11vnc, novnc)
   shell [--root]        interactive shell in the container
   exec [--root] CMD...  run a command in the container
   mcp                   stdio MCP server (for `claude mcp add containercomp -- ccu mcp`)
+
+Snapshots (images named <image>-snap-NAME; pin a known-good state, reset to it)
+  snapshot save NAME [-m DESC] [--force]   commit the container (paused if running)
+  snapshot list         snapshots of the current image; * marks the container's
+  snapshot rm NAME...   delete snapshots
+  snapshot export NAME FILE.tar | snapshot import FILE.tar [NAME]
 
 Apps and files
   install TARGET...     apt package names, URLs, or host files (.deb, .AppImage,
@@ -62,8 +72,8 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
-Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_NAME, CCU_IMAGE, CCU_SHOT_DIR,
-VNC_PASSWORD (applied when the container is created).
+Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_NAME,
+CCU_IMAGE, CCU_SHOT_DIR, VNC_PASSWORD (applied when the container is created).
 EOF
 }
 
@@ -131,12 +141,26 @@ EOF
 }
 
 cmd_up() {
+    local from="" run_image=$IMAGE cur
+    case "${1:-}" in
+        --from) from=${2:-}; snap_check_name "$from" ;;
+        --from=*) from=${1#*=}; snap_check_name "$from" ;;
+        "") ;;
+        *) die "usage: ccu up [--from SNAPSHOT]" ;;
+    esac
     ensure_machine
     check_rosetta
+    if [ -n "$from" ]; then
+        snap_require "$from"
+        run_image=$(snap_ref "$from")
+        cur=$(snap_from)
+        [ "$(state)" = missing ] || [ "$cur" = "$from" ] \
+            || die "container '$NAME' already exists (from ${cur:-the base image}); use: ccu${TARGET_FLAG} reset --from $from"
+    fi
     case "$(state)" in
         running) ;;
         missing)
-            podman image exists "$IMAGE" || cmd_build
+            [ -n "$from" ] || podman image exists "$IMAGE" || cmd_build
             local w=${SCREEN%x*} h=${SCREEN#*x}
             podman run -d --name "$NAME" --hostname "$NAME" \
                 --platform "$PLATFORM" \
@@ -145,7 +169,8 @@ cmd_up() {
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
                 -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
                 --label containercomp.target="$TARGET" \
-                "$IMAGE" >/dev/null
+                --label containercomp.from="$from" \
+                "$run_image" >/dev/null
             ;;
         *) podman start "$NAME" >/dev/null ;;
     esac
@@ -159,11 +184,30 @@ cmd_status() {
     echo "target:    $TARGET ($PLATFORM)"
     echo "container: $NAME ($s)"
     echo "image:     $IMAGE ($(podman image exists "$IMAGE" && echo present || echo 'not built'))"
+    [ "$s" = missing ] || cmd_status_from
     if [ "$s" = running ]; then
         echo "viewer:    http://localhost:$PORT/"
         echo "screen:    $(pexec cu size | tr ' ' x)"
         echo "windows:"
         pexec cu windows | sed 's/^/  /'
+    fi
+}
+
+# Which snapshot the container was created from, and whether it changed since.
+cmd_status_from() {
+    local from ref
+    from=$(snap_from)
+    if [ -z "$from" ]; then
+        echo "from:      base image (no snapshot)"
+        return 0
+    fi
+    ref=$(snap_ref "$from")
+    if ! podman image exists "$ref"; then
+        echo "from:      snapshot '$from' (since deleted)"
+    elif [ "$(podman container inspect -f '{{.Image}}' "$NAME")" != "$(podman image inspect -f '{{.Id}}' "$ref")" ]; then
+        echo "from:      snapshot '$from' (since replaced; reset uses the new one)"
+    else
+        echo "from:      snapshot '$from' ($ref)"
     fi
 }
 
@@ -228,6 +272,199 @@ cmd_cp_out() {
     podman cp "$NAME:$src" "${2:-.}"
 }
 
+# --- snapshots ----------------------------------------------------------------
+# A snapshot is the container committed to the image <IMAGE>-snap-NAME, so it
+# follows CCU_IMAGE and the target. A container records the snapshot it was
+# created from in the label containercomp.from (empty: the base image).
+
+snap_check_name() {
+    case "${1:-}" in
+        "") die "missing snapshot name (see: ccu snapshot list)" ;;
+        [!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) die "bad snapshot name '$1' (use letters, digits, '.', '_', '-')" ;;
+    esac
+    [ ${#1} -le 64 ] || die "snapshot name is longer than 64 characters"
+}
+
+# Image reference for snapshot $1 (with no argument: the common prefix).
+snap_ref() {
+    case "${IMAGE##*/}" in
+        *:*) echo "$IMAGE-snap-${1:-}" ;;
+        *) echo "$IMAGE:latest-snap-${1:-}" ;;
+    esac
+}
+
+snap_require() {
+    snap_check_name "$1"
+    podman image exists "$(snap_ref "$1")" \
+        || die "no snapshot '$1' for $IMAGE (see: ccu${TARGET_FLAG} snapshot list)"
+}
+
+# Snapshot the existing container was created from ("" for the base image).
+snap_from() {
+    [ "$(state)" != missing ] || return 0
+    podman container inspect -f '{{index .Config.Labels "containercomp.from"}}' "$NAME"
+}
+
+snap_names() {
+    local prefix ref
+    prefix=$(snap_ref)
+    podman images --format '{{.Repository}}:{{.Tag}}' | while read -r ref; do
+        case "$ref" in "$prefix"?*) echo "${ref#"$prefix"}" ;; esac
+    done | sort -u
+}
+
+snap_save() {
+    local name="" desc="" force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m|--message) [ $# -ge 2 ] || die "$1 needs a description"; desc=$2; shift 2 ;;
+            -f|--force) force=1; shift ;;
+            -*) die "unknown option '$1' (usage: ccu snapshot save NAME [-m DESC] [--force])" ;;
+            *) [ -z "$name" ] || die "usage: ccu snapshot save NAME [-m DESC] [--force]"; name=$1; shift ;;
+        esac
+    done
+    snap_check_name "$name"
+    ensure_machine
+    local s ref old="" pause=false
+    s=$(state)
+    [ "$s" != missing ] || die "container '$NAME' does not exist; nothing to snapshot"
+    ref=$(snap_ref "$name")
+    if podman image exists "$ref"; then
+        [ "$force" = 1 ] || die "snapshot '$name' already exists; add --force to replace it"
+        old=$(podman image inspect -f '{{.Id}}' "$ref")
+    fi
+    # Quotes and backslashes would break the LABEL instruction.
+    desc=$(printf '%s' "$desc" | tr -d '"\\' | tr '\n' ' ')
+    if [ "$s" = running ]; then
+        # Flush writes, then freeze every process for the commit so the image
+        # is a single point in time instead of files caught mid-write.
+        podman exec "$NAME" sync || true
+        pause=true
+    fi
+    echo "saving $NAME ($s) as snapshot '$name'..." >&2
+    # The runtime env (VNC_PASSWORD) is cleared so it doesn't travel with exports.
+    podman commit -q --pause="$pause" \
+        -c 'ENV VNC_PASSWORD=""' \
+        -c "LABEL containercomp.target=\"$TARGET\"" \
+        -c "LABEL containercomp.snapshot=\"$name\"" \
+        -c "LABEL containercomp.snapshot.base=\"$IMAGE\"" \
+        -c "LABEL containercomp.snapshot.parent=\"$(snap_from)\"" \
+        -c "LABEL containercomp.snapshot.created=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" \
+        -c "LABEL containercomp.snapshot.description=\"$desc\"" \
+        "$NAME" "$ref" >/dev/null
+    # Drop the replaced image unless a container still uses it.
+    [ -z "$old" ] || podman rmi "$old" >/dev/null 2>&1 || true
+    echo "saved snapshot '$name' ($ref)"
+    echo "start from it with: ccu${TARGET_FLAG} reset --from $name"
+}
+
+snap_list() {
+    ensure_machine
+    local names cur n ref mark
+    names=$(snap_names)
+    if [ -z "$names" ]; then
+        echo "no snapshots of $IMAGE (create one with: ccu${TARGET_FLAG} snapshot save NAME)"
+        return 0
+    fi
+    cur=$(snap_from)
+    printf '  %-24s %-21s %-9s %s\n' NAME CREATED SIZE DESCRIPTION
+    for n in $names; do
+        ref=$(snap_ref "$n")
+        mark=" "
+        [ "$n" != "$cur" ] || mark="*"
+        printf '%s %-24s %-21s %-9s %s\n' "$mark" "$n" \
+            "$(podman image inspect -f '{{index .Labels "containercomp.snapshot.created"}}' "$ref")" \
+            "$(podman images --format '{{.Size}}' "$ref" | head -n 1)" \
+            "$(podman image inspect -f '{{index .Labels "containercomp.snapshot.description"}}' "$ref")"
+    done
+    [ -z "$cur" ] || echo "* = container '$NAME' was created from this snapshot"
+}
+
+snap_rm() {
+    [ $# -gt 0 ] || die "usage: ccu snapshot rm NAME..."
+    ensure_machine
+    local n
+    for n in "$@"; do snap_require "$n"; done
+    for n in "$@"; do
+        podman rmi "$(snap_ref "$n")" >/dev/null \
+            || die "could not remove snapshot '$n'; if container '$NAME' uses it, run 'ccu${TARGET_FLAG} reset --base' or 'ccu${TARGET_FLAG} rm' first"
+        echo "removed snapshot '$n'"
+    done
+}
+
+snap_export() {
+    [ $# -eq 2 ] || die "usage: ccu snapshot export NAME FILE.tar"
+    ensure_machine
+    snap_require "$1"
+    echo "exporting snapshot '$1' to $2 (includes the base image layers)..." >&2
+    podman save -q -o "$2" "$(snap_ref "$1")"
+    echo "exported $2 ($(du -h "$2" | cut -f1))"
+}
+
+snap_import() {
+    [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: ccu snapshot import FILE.tar [NAME]"
+    [ -f "$1" ] || die "no such file: $1"
+    ensure_machine
+    local out loaded name ref arch
+    out=$(podman load -i "$1") || die "podman load failed for $1"
+    loaded=$(printf '%s\n' "$out" | sed -n 's/^Loaded image[^:]*: *//p' | head -n 1)
+    [ -n "$loaded" ] || die "could not find the loaded image in: $out"
+    name=${2:-$(podman image inspect -f '{{index .Labels "containercomp.snapshot"}}' "$loaded")}
+    [ -n "$name" ] || die "$1 is not a ccu snapshot; pass a NAME to import it anyway"
+    snap_check_name "$name"
+    ref=$(snap_ref "$name")
+    # Retag under this checkout's base image so list/up/reset find it.
+    if [ "$loaded" != "$ref" ]; then
+        podman tag "$loaded" "$ref"
+        podman untag "$loaded" "$loaded" >/dev/null 2>&1 || true
+    fi
+    arch=$(podman image inspect -f '{{.Architecture}}' "$ref")
+    [ "$arch" = "${PLATFORM#linux/}" ] || echo "warning: snapshot is $arch but target $TARGET is ${PLATFORM#linux/}" >&2
+    echo "imported snapshot '$name' ($ref)"
+}
+
+cmd_snapshot() {
+    local sub=${1:-list}
+    [ $# -eq 0 ] || shift
+    case "$sub" in
+        save) snap_save "$@" ;;
+        list|ls) snap_list ;;
+        rm) snap_rm "$@" ;;
+        export) snap_export "$@" ;;
+        import) snap_import "$@" ;;
+        *) die "unknown snapshot command '$sub' (save, list, rm, export, import)" ;;
+    esac
+}
+
+# Recreate the container from the snapshot it came from, another one
+# (--from NAME), or the base image (--base). Validates before deleting.
+cmd_reset() {
+    local from="" set=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from) from=${2:-}; set=1; shift; [ $# -eq 0 ] || shift; snap_check_name "$from" ;;
+            --from=*) from=${1#*=}; set=1; shift; snap_check_name "$from" ;;
+            --base) from=""; set=1; shift ;;
+            *) die "usage: ccu reset [--from NAME | --base]" ;;
+        esac
+    done
+    ensure_machine
+    [ "$set" = 1 ] || from=$(snap_from)
+    if [ -n "$from" ]; then snap_require "$from"; fi
+    if [ "$(state)" != missing ]; then
+        local old
+        old=$(podman container inspect -f '{{.Image}}' "$NAME")
+        podman rm -f "$NAME" >/dev/null
+        echo "removed $NAME" >&2
+        # A snapshot replaced with save --force stays behind untagged while in use.
+        if [ -n "$(podman image inspect -f '{{index .Labels "containercomp.snapshot"}}' "$old" 2>/dev/null)" ] \
+            && [ "$(podman image inspect -f '{{len .RepoTags}}' "$old")" = 0 ]; then
+            podman rmi "$old" >/dev/null 2>&1 || true
+        fi
+    fi
+    if [ -n "$from" ]; then cmd_up --from "$from"; else cmd_up; fi
+}
+
 # --- main ---------------------------------------------------------------------
 
 TARGET_FLAG=""
@@ -256,9 +493,11 @@ fi
 case "$cmd" in
     help) usage ;;
     build) cmd_build ;;
-    up|start) cmd_up ;;
+    up|start) cmd_up "$@" ;;
     down|stop) podman stop -t 5 "$NAME" >/dev/null && echo "stopped $NAME" ;;
-    rm|reset) podman rm -f "$NAME" >/dev/null && echo "removed $NAME" ;;
+    rm) podman rm -f "$NAME" >/dev/null && echo "removed $NAME" ;;
+    reset) cmd_reset "$@" ;;
+    snapshot|snap) cmd_snapshot "$@" ;;
     status) cmd_status ;;
     open) require_running; open "http://localhost:$PORT/" ;;
     logs)
