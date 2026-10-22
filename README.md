@@ -65,7 +65,7 @@ Elements    tree [--app A] [--role R] [--name N] [--all] [--hidden] [--json] | t
 Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
 Tests       test run SPEC... [--from SNAP|--base|--no-reset] [--repeat N] [--keep-going] [--record] [--out DIR]
             test validate SPEC...   test draft [--since SEQ | --last N]
-Network     up --egress FILE | up --offline   egress [status] | egress log [-f] [--all] | egress set FILE|offline
+Network     up --egress FILE | up --offline [--upstream URL|none]   egress [status] | egress log [-f] [--all] | egress set FILE|offline
 ```
 
 `ccu screenshot` saves a PNG and prints its path, which Claude then reads. Screenshots are at native resolution (default 1280x800), so a pixel in the screenshot is the pixel you click.
@@ -129,6 +129,7 @@ Tested on 2026-10-22: Chromium 155 (arm64) and Chrome 156 (x86 target, Rosetta) 
 | `CCU_SHOT_DIR` | `$TMPDIR/ccu` | where screenshots are saved |
 | `CCU_EGRESS` | *(none)* | allowlist file or `offline`, same as `ccu up --egress` (see [Restricting network access](#restricting-network-access)) |
 | `CCU_EGRESS_IMAGE` | `localhost/containercomp-egress:latest` | image for the egress proxy, built from `egress/` |
+| `CCU_UPSTREAM_PROXY` | *(host `HTTPS_PROXY`)* | proxy the egress proxy forwards through, same as `ccu up --upstream` (see [Behind a corporate proxy](#behind-a-corporate-proxy)) |
 
 Keep the screen around 1280x800 or smaller. Larger screenshots get downscaled before the model sees them, which hurts click accuracy.
 
@@ -367,7 +368,28 @@ Entries are host names only: no URLs, ports or paths. An allowlisted host is all
 - Filtering is by host name, not by URL or content. Allowed traffic isn't inspected.
 - DNS: the internal network has no resolver, and the proxy rejects off-list names before it looks anything up, so DNS can't be used to send data out. The proxy resolves only names on the allowlist. A wildcard entry covers any subdomain, so that domain's DNS servers can see whatever subdomain names are requested.
 - `ccu exec`, `cp-in`/`cp-out` and the viewer run from the host through Podman, not over the container's network, so the filter doesn't apply to them.
-- Corporate networks: the egress proxy connects out directly and ignores your host's `HTTP_PROXY`. That works where the Mac's network client intercepts traffic transparently (Zscaler Client Connector, for example), as long as the CA is trusted (`ccu certs`). It doesn't yet work on networks that only allow traffic through an explicit upstream proxy.
+- Proxies that need NTLM or Kerberos (Negotiate) authentication, PAC files, and `https://` or SOCKS proxies aren't supported as the upstream; see below.
+
+### Behind a corporate proxy
+
+Where only an explicit proxy can reach the internet, the egress proxy forwards allowed requests to it (as a squid parent, HTTPS through `CONNECT`). Your allowlist is still checked first by the egress proxy, so blocked hosts never reach the corporate proxy. Which proxy it uses, first match wins:
+
+1. `ccu up --egress FILE --upstream http://proxy.corp.example:8080` (or `--upstream none` to connect directly)
+2. `CCU_UPSTREAM_PROXY`, same values
+3. your shell's `https_proxy`, `HTTPS_PROXY`, `http_proxy`, `HTTP_PROXY`, the same variables an unfiltered desktop gets. `CCU_PROXY=0` skips them.
+
+```bash
+ccu up --egress allowlist.txt                     # uses HTTPS_PROXY from your shell, if set
+ccu egress                                        # upstream: http://proxy.corp.example:8080, from HTTPS_PROXY
+ccu up --upstream http://proxy2.corp.example:3128 # switch a running filtered desktop to another proxy
+```
+
+- A proxy on your Mac's `localhost` (cntlm, px, a PAC helper) becomes `host.containers.internal`, as for the unfiltered passthrough.
+- Hosts in your shell's `NO_PROXY` go direct, typically intranet hosts the corporate proxy can't reach. They must still be on the allowlist. `corp.example` and `.corp.example` cover the domain and its subdomains, IPv4 addresses and CIDR ranges match requests by IP, and IPv6 entries and ports are ignored. `NO_PROXY=*` turns the host proxy off. `host.containers.internal` (services on your Mac) always goes direct.
+- **Proxy passwords:** `http://user:password@proxy:port` works with Basic authentication (percent-encode special characters, as in any URL: `p%40ss` for `p@ss`). The URL is written only to `/etc/squid/upstream.conf` in the egress container (readable by root and squid). The desktop never sees it, `ccu status` and `ccu egress` show the proxy without credentials, and it isn't in the egress log, container labels, the audit log or snapshots. Prefer the environment variable to `--upstream` for a password, since command lines show up in `ps` and shell history. For NTLM or Kerberos, run a local helper such as cntlm or px on the Mac and point at it on `localhost`.
+- `ccu egress log` lists blocked requests. If allowlisted hosts fail with `503`, the corporate proxy is unreachable or refusing (`407`: wrong password). `ccu egress log --all` shows `FIRSTUP_PARENT` for requests that went through the upstream and `HIER_DIRECT` for direct ones.
+- The upstream is chosen when the desktop is created. `ccu up --upstream URL|none` (or `CCU_UPSTREAM_PROXY`) changes it on an existing filtered desktop, which restarts the egress proxy. `ccu reset` keeps an upstream that was given with `--upstream` or `CCU_UPSTREAM_PROXY`. It reads one that came from `HTTPS_PROXY`/`HTTP_PROXY` again from your shell, just as an unfiltered desktop picks up the shell's proxy when it's recreated.
+- `ccu egress build` (and the automatic first build) passes your proxy and `ccu certs` CAs to the image build, so apk works behind the proxy too. Egress images built before this feature are rebuilt automatically when an upstream is needed.
 
 ## Corporate networks
 
@@ -394,7 +416,7 @@ ccu up                  # new containers get them; a running one is updated righ
 
   The env variables are set in the image, so containers from images built before this feature need `ccu build` and a new container (`ccu rm && ccu up`) for the Python certifi and Node cases; the system store, Firefox and NSS work on older containers too. Tools with their own pinned bundle (some Java apps with a private keystore, a few Electron apps) may still need their own configuration.
 
-**Proxy.** If `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY` (either case) are set when the container is created, `ccu up` passes them in, in both cases, and writes them to apt's config and sudo's `env_keep`, so `sudo apt` works too. `ccu build` passes them as build args. A proxy on `localhost`/`127.0.0.1` on your Mac (a local PAC helper or forwarding proxy, for example) is rewritten to `host.containers.internal`, which is how the container reaches the Mac. `localhost` and `host.containers.internal` are added to `NO_PROXY`. Proxy settings are fixed when the container is created, so after changing them run `ccu rm && ccu up`. Set `CCU_PROXY=0` to pass nothing (that also stops Podman's own proxy passthrough). PAC files aren't evaluated, so point `HTTPS_PROXY` at the actual proxy.
+**Proxy.** If `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY` (either case) are set when the container is created, `ccu up` passes them in, in both cases, and writes them to apt's config and sudo's `env_keep`, so `sudo apt` works too. `ccu build` passes them as build args. A proxy on `localhost`/`127.0.0.1` on your Mac (a local PAC helper or forwarding proxy, for example) is rewritten to `host.containers.internal`, which is how the container reaches the Mac. `localhost` and `host.containers.internal` are added to `NO_PROXY`. Proxy settings are fixed when the container is created, so after changing them run `ccu rm && ccu up`. Set `CCU_PROXY=0` to pass nothing (that also stops Podman's own proxy passthrough). PAC files aren't evaluated, so point `HTTPS_PROXY` at the actual proxy. In egress mode (`--egress`/`--offline`) the desktop gets the egress proxy instead, and the egress proxy forwards through yours (see [Behind a corporate proxy](#behind-a-corporate-proxy)).
 
 **Pulling the base image (`podman pull`) behind the proxy.** That runs in the Podman VM, which has its own trust store. Opt in with:
 

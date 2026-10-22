@@ -8,4 +8,8 @@ chown squid:squid /run/squid /var/log/squid
 touch /var/log/squid/access.log
 chown squid:squid /var/log/squid/access.log
 rm -f /run/squid/squid.pid
+# ccu copies upstream.conf in with the host file's 0600 mode; squid re-reads it
+# as the squid user on reconfigure.
+chown root:squid /etc/squid/upstream.conf
+chmod 0640 /etc/squid/upstream.conf
 exec squid -N -f /etc/squid/squid.conf

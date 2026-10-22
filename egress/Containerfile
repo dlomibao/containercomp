@@ -5,12 +5,21 @@
 #   podman build -t localhost/containercomp-egress:latest egress/
 FROM docker.io/library/alpine:3.22
 
+# Extra CA certificates (PEM) for apk behind a TLS-inspecting proxy; `ccu`
+# passes them from `ccu certs`.
+ARG CCU_EXTRA_CA=""
+RUN if [ -n "$CCU_EXTRA_CA" ]; then printf '%s\n' "$CCU_EXTRA_CA" >> /etc/ssl/certs/ca-certificates.crt; fi
+
 RUN apk add --no-cache squid \
     && touch /etc/squid/allowlist.txt
 
-COPY squid.conf /etc/squid/squid.conf
+COPY squid.conf upstream.conf /etc/squid/
 COPY entrypoint /usr/local/bin/ccu-egress
-RUN chmod 0755 /usr/local/bin/ccu-egress && chmod 0644 /etc/squid/squid.conf /etc/squid/allowlist.txt
+RUN chmod 0755 /usr/local/bin/ccu-egress \
+    && chmod 0644 /etc/squid/squid.conf /etc/squid/allowlist.txt /etc/squid/upstream.conf
+
+# ccu checks this before it configures an upstream proxy (cache_peer include).
+LABEL containercomp.egress.upstream="1"
 
 EXPOSE 3128
 ENTRYPOINT ["/usr/local/bin/ccu-egress"]
