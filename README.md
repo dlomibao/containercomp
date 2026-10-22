@@ -48,7 +48,9 @@ Then ask Claude Code something like *"Install inkscape in the container and draw
 ```text
 ccu [-t native|x86] <command>
 
-Lifecycle   build | up | down | rm | status | open | logs [svc] | shell [--root] | exec [--root] CMD | mcp
+Lifecycle   build | up [--from SNAP] | down | rm | reset [--from SNAP | --base] | status | open
+            logs [svc] | shell [--root] | exec [--root] CMD | mcp
+Snapshots   snapshot save NAME [-m DESC] [--force] | list | rm NAME... | export NAME FILE | import FILE [NAME]
 Apps        install <apt-pkg|url|host-file>...   cp-in HOST [DEST]   cp-out SRC [HOST]
 Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             click X Y [--button B] [--mods ctrl]   double_click | triple_click | right_click | middle_click
@@ -79,6 +81,7 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
 | `CCU_SCREEN` | `1280x800` | screen size, applied when the container is created |
 | `CCU_PORT` | `6080` / `6081` | host port for noVNC (always bound to 127.0.0.1) |
 | `CCU_NAME` | `ccu` / `ccu-x86` | container name |
+| `CCU_IMAGE` | `localhost/containercomp:<target>` | base image; snapshots are named `<image>-snap-NAME` |
 | `VNC_PASSWORD` | *(none)* | require a password in the viewer |
 | `CCU_SHOT_DIR` | `$TMPDIR/ccu` | where screenshots are saved |
 
@@ -92,13 +95,38 @@ claude mcp add -s user containercomp -- ccu mcp
 
 Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`.
 
-## Persistence
+## Snapshots and clean-state resets
 
-`ccu down` stops the container and `ccu up` resumes it with everything you installed. `ccu rm` deletes the container and returns to a clean image. To keep a configured setup as a new image:
+`ccu down` stops the container and `ccu up` resumes it with everything you installed. `ccu rm` deletes the container. For repeatable testing, set up the app once, snapshot that state, and start every run from it:
 
 ```bash
-podman commit ccu localhost/containercomp:native   # overwrite the base image with the current state
+ccu up
+ccu install galculator            # install and configure the app once
+ccu snapshot save golden -m "galculator, first-run dialogs dismissed"
+
+ccu reset --from golden           # fresh container from the snapshot
+# ... test run 1 ...
+ccu reset                         # back to golden again (it remembers where it came from)
+# ... test run 2 ...
+ccu reset --base                  # back to the clean base image
 ```
+
+| Command | What it does |
+|---|---|
+| `ccu snapshot save NAME [-m DESC]` | commits the container to the image `<image>-snap-NAME` (for example `localhost/containercomp:native-snap-golden`), with labels for the target, base image, creation time and description. A running container is paused for the commit. An existing name needs `--force`. |
+| `ccu snapshot list` | snapshots of the current base image (`CCU_IMAGE`, per target); `*` marks the one the container was created from |
+| `ccu snapshot rm NAME...` | deletes snapshots. One that a container still uses can't be removed until you `reset` or `rm` that container. |
+| `ccu up --from NAME` | creates the container from a snapshot (if no container exists yet) |
+| `ccu reset [--from NAME \| --base]` | deletes the container and creates a new one from the snapshot it came from, another snapshot, or the base image, then starts it. The snapshot is checked before anything is deleted. |
+| `ccu snapshot export NAME FILE.tar` / `import FILE.tar [NAME]` | share a snapshot with a teammate (`podman save`/`load`). The archive contains the base image layers too, so expect about 1 GB or more. Import retags it under your own base image. |
+
+`ccu status` shows which snapshot the container came from, and whether that snapshot has since been replaced or deleted.
+
+Things to know:
+- A snapshot holds the container's filesystem only: installed packages, files, app settings. It doesn't hold running processes, so apps that were open at save time aren't running after a restore. Volumes and bind mounts aren't included.
+- On every boot, `/opt/ccu/bin/clean-runtime` deletes the stale X lock, sockets, D-Bus and session files that a snapshot of a live desktop carries, so a restored container boots like a fresh one. Pausing makes the snapshot a single point in time, but an app that was in the middle of saving can still leave a half-written file. Close or save apps before you snapshot when that matters.
+- Snapshots share the base image's layers, so each one only costs the space of its changes. A snapshot depends on its base image, though: rebuilding the base doesn't update existing snapshots.
+- `VNC_PASSWORD` is cleared from a snapshot's environment. Everything else in the container, including files under `~`, ends up in exported archives, so don't export snapshots that contain secrets.
 
 ## Notes and limits
 
