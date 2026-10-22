@@ -90,6 +90,21 @@ ccu focus "Mousepad"                # raise a window by title
 ccu wait 2
 ```
 
+## Clipboard
+
+```bash
+ccu clip paste - < notes.txt        # set the clipboard and press ctrl+v in the focused field
+ccu clip paste --key ctrl+shift+v "make test"   # terminals paste with ctrl+shift+v
+ccu clip set "text"                 # set only (also: cmd | ccu clip set -)
+ccu clip get                        # read what an app copied (after ctrl+c / a "Copy" button)
+ccu clip push / ccu clip pull       # Mac clipboard -> desktop / desktop -> Mac (text or PNG)
+```
+
+- For anything longer than a line or two, or with newlines, `clip paste` is faster and more reliable than `type`: `type` presses Return for every newline (which can submit a form) and sends one key per character. Use `type` for short input and for fields that block pasting.
+- To read text you can't select easily from a screenshot (a generated token, an error message, a URL), copy it in the app and run `ccu clip get` instead of zooming and transcribing.
+- `ccu clip pull` overwrites the user's Mac clipboard. Do it only when the user asks for something on their clipboard.
+- Clipboard contents are logged like typed text (length only by default).
+
 Key names use xdotool syntax: `Return`, `Escape`, `Tab`, `BackSpace`, `Delete`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `Page_Up`, `Page_Down`, `F1`..`F12`, `super`, plus combos such as `ctrl+shift+t` and `alt+F4`.
 
 ## Tips
@@ -149,4 +164,4 @@ The user can start the desktop with limited network access: `ccu up --egress all
 
 ## MCP alternative
 
-The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. A server drives one desktop (the default one here); for a named desktop, use the server registered for it (`mcp__ccu-NAME__*`) or the CLI with `-n NAME`. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.
+The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `clipboard_get`, `clipboard_set` (with `paste: true` to paste), `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. A server drives one desktop (the default one here); for a named desktop, use the server registered for it (`mcp__ccu-NAME__*`) or the CLI with `-n NAME`. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.

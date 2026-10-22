@@ -103,6 +103,14 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
+Clipboard (the desktop's CLIPBOARD selection; --primary for PRIMARY)
+  clip get [--type MIME]   print it (--type image/png writes PNG bytes)
+  clip set TEXT|-       set it (- reads stdin; --type image/png for a PNG on stdin)
+  clip paste TEXT|- [--key COMBO]   set it and press ctrl+v (or COMBO, e.g.
+                        ctrl+shift+v in terminals); faster than type for long text
+  clip push | pull      copy the Mac clipboard into the desktop / back (text or PNG)
+  clip targets          data types it currently holds
+
 Audit and recording (every action is logged; see README "Audit and recording")
   audit tail [N]        last N audit log entries (JSONL)
   audit verify          check the log's hash chain and compare it with the host mirror
@@ -514,6 +522,100 @@ cmd_record() {
             ;;
         status) pexec cu record status ;;
         *) die "usage: ccu record start [FILE.mp4] | stop | status" ;;
+    esac
+}
+
+# --- clipboard ------------------------------------------------------------------
+# The container's X clipboard, plus bridging to the Mac pasteboard. Text always
+# travels over stdin, so it stays out of process listings and has no size limit.
+
+# pexec with this script's stdin forwarded into the container.
+pexec_in() {
+    if [ "$AUDIT_MIRROR" = off ]; then
+        podman exec -i -u user -w /home/user -e DISPLAY=:1 "${AUDIT_ENV[@]}" "$NAME" "$@"
+    else
+        podman exec -i -u user -w /home/user -e DISPLAY=:1 "${AUDIT_ENV[@]}" "$NAME" "$@" 2> >(audit_tee)
+    fi
+}
+
+CLIP_USAGE="usage: ccu clip get [--primary] [--type MIME] | set TEXT|- | paste TEXT|- [--key COMBO] | push | pull | targets"
+
+# The Mac pasteboard holds PNG data (AppleScript class PNGf)?
+mac_clip_has_png() {
+    osascript -e 'clipboard info for «class PNGf»' 2>/dev/null | grep -q PNGf
+}
+
+cmd_clip() {
+    local sub=${1:-get} opts=() text="" have=0 tmp n
+    [ $# -eq 0 ] || shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --primary) opts+=("$1"); shift ;;
+            --type|--key) [ $# -ge 2 ] || die "$1 needs a value"; opts+=("$1" "$2"); shift 2 ;;
+            --) shift; [ $# -eq 1 ] || die "$CLIP_USAGE"; text=$1; have=1; shift ;;
+            -?*) die "unknown option '$1' ($CLIP_USAGE)" ;;
+            *) [ "$have" = 0 ] || die "$CLIP_USAGE (quote the text as one argument)"; text=$1; have=1; shift ;;
+        esac
+    done
+    case "$sub" in
+        push|pull)
+            case "$have:${opts[*]:-}" in 0:|0:--primary) ;; *) die "usage: ccu clip push|pull [--primary]" ;; esac ;;
+    esac
+    case "$sub" in
+        get|targets)
+            [ "$have" = 0 ] || die "$CLIP_USAGE"
+            pexec cu clip "$sub" ${opts[@]+"${opts[@]}"}
+            ;;
+        set|paste)
+            [ "$have" = 1 ] || die "$CLIP_USAGE"
+            if [ "$text" = - ]; then
+                pexec_in cu clip "$sub" ${opts[@]+"${opts[@]}"} -
+            else
+                printf '%s' "$text" | pexec_in cu clip "$sub" ${opts[@]+"${opts[@]}"} -
+            fi
+            if [ "$sub" = paste ] && [ "$SHOT" = 1 ]; then sleep 0.6; cmd_screenshot; fi
+            ;;
+        push)
+            # Mac -> container: text if the pasteboard has any, else a PNG image.
+            [ "$(uname -s)" = Darwin ] || die "clip push/pull use the macOS pasteboard; elsewhere pipe into: ccu clip set -"
+            n=$(LC_ALL=en_US.UTF-8 pbpaste | wc -c | tr -d ' ')
+            if [ "$n" -gt 0 ]; then
+                LC_ALL=en_US.UTF-8 pbpaste | pexec_in cu clip set ${opts[@]+"${opts[@]}"} -
+                echo "copied $n bytes of text from the Mac clipboard" >&2
+            elif mac_clip_has_png; then
+                tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccu-clip.XXXXXX")
+                osascript -e 'on run argv' \
+                    -e 'set f to open for access (POSIX file (item 1 of argv)) with write permission' \
+                    -e 'write (the clipboard as «class PNGf») to f' -e 'close access f' \
+                    -e 'end run' "$tmp/clip.png" >/dev/null
+                pexec_in cu clip set ${opts[@]+"${opts[@]}"} --type image/png - < "$tmp/clip.png"
+                echo "copied a PNG image ($(wc -c < "$tmp/clip.png" | tr -d ' ') bytes) from the Mac clipboard" >&2
+                rm -rf "$tmp"
+            else
+                die "the Mac clipboard holds no text or PNG image"
+            fi
+            ;;
+        pull)
+            # Container -> Mac. Fetched into a private temp file first, so a
+            # failure leaves the Mac clipboard as it was.
+            [ "$(uname -s)" = Darwin ] || die "clip push/pull use the macOS pasteboard; elsewhere use: ccu clip get"
+            n=$(pexec cu clip targets ${opts[@]+"${opts[@]}"})
+            tmp=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/ccu-clip.XXXXXX")
+            if printf '%s\n' "$n" | grep -qxE 'UTF8_STRING|STRING|TEXT|text/plain(;charset=utf-8)?' \
+                || ! printf '%s\n' "$n" | grep -qx image/png; then
+                pexec cu clip get ${opts[@]+"${opts[@]}"} > "$tmp/clip" || { rm -rf "$tmp"; exit 1; }
+                LC_ALL=en_US.UTF-8 pbcopy < "$tmp/clip"
+                echo "copied $(wc -c < "$tmp/clip" | tr -d ' ') bytes of text to the Mac clipboard" >&2
+            else
+                pexec cu clip get ${opts[@]+"${opts[@]}"} --type image/png > "$tmp/clip.png" || { rm -rf "$tmp"; exit 1; }
+                osascript -e 'on run argv' \
+                    -e 'set the clipboard to (read (POSIX file (item 1 of argv)) as «class PNGf»)' \
+                    -e 'end run' "$tmp/clip.png" >/dev/null
+                echo "copied a PNG image ($(wc -c < "$tmp/clip.png" | tr -d ' ') bytes) to the Mac clipboard" >&2
+            fi
+            rm -rf "$tmp"
+            ;;
+        *) die "$CLIP_USAGE" ;;
     esac
 }
 
@@ -1173,6 +1275,7 @@ case "$cmd" in
     zoom) require_running; cmd_zoom "$@" ;;
     audit) require_running; cmd_audit "$@" ;;
     record) require_running; cmd_record "$@" ;;
+    clip) require_running; cmd_clip "$@" ;;
     click|double_click|triple_click|right_click|middle_click|move|mouse_down|mouse_up|drag|scroll|type|key|launch|focus|wait_window|wait|windows|active|size|cursor)
         require_running
         pexec cu "$cmd" "$@"

@@ -117,6 +117,34 @@ def key(combos: list[str], screenshot: bool = False):
 
 
 @mcp.tool()
+def clipboard_get(primary: bool = False):
+    """Read the desktop's clipboard (what ctrl+c copied). Returns its text, or the
+    image if it holds a PNG. primary=True reads the PRIMARY selection instead
+    (the last text highlighted with the mouse)."""
+    data, kind = cu.clipboard_get("primary" if primary else "clipboard", image_ok=True)
+    if kind == "image/png":
+        return Image(data=data, format="png")
+    return data
+
+
+@mcp.tool()
+def clipboard_set(text: str, paste: bool = False, paste_key: str = "ctrl+v", primary: bool = False,
+                  screenshot: bool = False):
+    """Put text on the desktop's clipboard. paste=True then presses paste_key into
+    the focused window (ctrl+v; terminals use ctrl+shift+v). Pasting long or
+    multi-line text this way is faster and more reliable than type_text, but
+    some fields (password boxes, terminals) handle pasted newlines differently.
+    primary=True sets the PRIMARY selection (middle-click paste) instead."""
+    if paste and primary:
+        raise cu.CuError("paste uses the clipboard; leave primary off")
+    cu.clipboard_set(text, "primary" if primary else "clipboard")
+    if paste:
+        cu.key(paste_key)
+        return _done(f"pasted {len(text)} chars with {paste_key}", screenshot)
+    return _done(f"clipboard set ({len(text)} chars)", screenshot)
+
+
+@mcp.tool()
 def launch(command: str, wait_for_window: str = "", timeout: float = 30.0, screenshot: bool = True):
     """Start a GUI app in the background (shell command, e.g. "mousepad" or
     "wine ~/apps/app.exe"). Optionally wait until a window title contains

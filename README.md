@@ -59,6 +59,7 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             type TEXT   key COMBO...   launch CMD...   windows | active | size | cursor
             focus TITLE   wait_window TITLE [--timeout S]   wait S
             (append --shot to any screen command to screenshot afterwards)
+Clipboard   clip get | set TEXT|- | paste TEXT|- | push | pull | targets   [--primary] [--type image/png]
 Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
 Network     up --egress FILE | up --offline   egress [status] | egress log [-f] [--all] | egress set FILE|offline
 ```
@@ -98,7 +99,7 @@ Keep the screen around 1280x800 or smaller. Larger screenshots get downscaled be
 claude mcp add -s user containercomp -- ccu mcp
 ```
 
-Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. Each server drives one desktop. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`, and for a named one, one per name: `claude mcp add -s user ccu-foo -- ccu -n foo mcp` (its tools show up as `mcp__ccu-foo__*`).
+Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `clipboard_get`, `clipboard_set`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. Each server drives one desktop. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`, and for a named one, one per name: `claude mcp add -s user ccu-foo -- ccu -n foo mcp` (its tools show up as `mcp__ccu-foo__*`).
 
 ## Several desktops at once
 
@@ -124,9 +125,31 @@ ccu -n winapp install ~/Downloads/setup.msi   # no -t needed: the desktop rememb
 - Each desktop is a full XFCE session. An idle native one used about 150–350 MB of RAM in testing; apps add to that, and x86 under emulation costs more CPU. Size the Podman machine for the number you run at once.
 - There's no `--all`: `down`, `rm` and `reset` act on one desktop. To stop several, name them: `for n in a b c; do ccu -n $n down; done`.
 
+## Clipboard
+
+`ccu clip` reads and sets the desktop's clipboard (the X `CLIPBOARD` selection, what ctrl+c and ctrl+v use) and copies between it and the Mac's:
+
+```bash
+ccu clip set "some text"          # or: some-command | ccu clip set -
+ccu clip paste - < long.txt       # set it, then press ctrl+v in the focused window
+ccu clip paste --key ctrl+shift+v "ls -la"   # terminals paste with ctrl+shift+v
+ccu clip get                      # what an app copied (prints it exactly, no newline added)
+ccu clip push                     # Mac clipboard -> desktop (text, or a PNG image)
+ccu clip pull                     # desktop clipboard -> Mac
+ccu clip get --type image/png > shot.png      # images: ccu clip set --type image/png - < shot.png
+```
+
+- **Pasting beats typing for long text.** `type` sends one key event per character (about 12 ms each), while `clip paste` sets the clipboard and presses ctrl+v once: 200 lines (14 KB) pasted into Mousepad in about 0.3 s. Multi-line text pastes as text; with `type`, each newline is a Return key press, which submits forms and dialogs.
+- A value you set stays after `ccu` exits: `xclip` keeps serving it in the background until something else is copied. What an app copies stays readable after the app closes (the XFCE session keeps a copy; tested with Mousepad).
+- `--primary` uses the `PRIMARY` selection instead (the last text highlighted with the mouse, pasted with a middle click). `ccu clip targets` lists the data types the clipboard holds.
+- Text is UTF-8. Besides text, PNG images work in both directions (`--type image/png`, and `push`/`pull` move images automatically). Other types can be read or set with `--type MIME`; `clip get` without `--type` fails with a hint when the clipboard holds only an image.
+- Text is always sent over stdin, never on a command line, so it doesn't show up in process listings; there's no size limit beyond memory. `pull` writes the desktop's clipboard through a private temp file and leaves the Mac clipboard alone if reading it fails.
+- Clipboard reads and writes are logged like `type`: only the length by default (`CCU_AUDIT_TYPE`). They don't take audit screenshots, since the screen doesn't change; with `paste`, the ctrl+v is logged as its own `key` entry with a screenshot.
+- MCP: `clipboard_get` returns the text (or the image), and `clipboard_set` takes `text`, plus `paste: true` to press ctrl+v (or `paste_key`) right away.
+
 ## Audit and recording
 
-Every action is logged, whether it comes from the CLI or the MCP server: clicks, moves, drags, scrolls, typing, keys, launches, focus changes, `install`, `exec`, MCP `shell`, file copies and recordings. Screenshots and zooms are logged as observations. The log is JSONL at `/var/log/ccu/audit/audit.jsonl` in the container, one entry per line:
+Every action is logged, whether it comes from the CLI or the MCP server: clicks, moves, drags, scrolls, typing, keys, clipboard reads and writes, launches, focus changes, `install`, `exec`, MCP `shell`, file copies and recordings. Screenshots and zooms are logged as observations. The log is JSONL at `/var/log/ccu/audit/audit.jsonl` in the container, one entry per line:
 
 ```json
 {"seq":8,"ts":"2026-10-22T04:15:55.509Z","source":"cli","kind":"action","action":"type",
@@ -136,7 +159,7 @@ Every action is logged, whether it comes from the CLI or the MCP server: clicks,
 
 - `source` is `cli` (through `ccu`), `mcp`, or `container` (`cu` run directly inside the container). `kind` is `action`, `observation` or `command`. `ts` is when the action started, `ms` how long it took, and `window` the active window title at that moment.
 - `shot` is a screenshot taken about 0.5 s after each state-changing action (2 s after `launch`), in the background so the action isn't slowed down. For screenshots and zooms it is a copy of the image the agent saw. Only the newest 500 screenshots are kept (`CCU_AUDIT_MAX_SHOTS`); older ones are deleted, and their entries stay in the log. In testing, screenshots were 20 to 100 KB; busier screens are larger.
-- **Typed text is redacted by default**: `type` entries record only the length. `CCU_AUDIT_TYPE=hash` adds a sha256 of the text, so you can check whether a known value was typed, but short secrets can be brute-forced from it. `CCU_AUDIT_TYPE=full` logs the text itself. Screenshots still show whatever text appears on screen, so turn them off (`CCU_AUDIT_SHOTS=0`) for sessions that handle secrets. `exec`, `shell` and `launch` commands are logged in full, with the last 1000 characters of `exec` and `shell` output.
+- **Typed text is redacted by default**: `type` entries record only the length, and so do clipboard reads and writes. `CCU_AUDIT_TYPE=hash` adds a sha256 of the text, so you can check whether a known value was typed, but short secrets can be brute-forced from it. `CCU_AUDIT_TYPE=full` logs the text itself. Screenshots still show whatever text appears on screen, so turn them off (`CCU_AUDIT_SHOTS=0`) for sessions that handle secrets. `exec`, `shell` and `launch` commands are logged in full, with the last 1000 characters of `exec` and `shell` output.
 
 ```bash
 ccu audit tail 20             # last entries
@@ -153,7 +176,7 @@ ccu record stop               # finish it and copy it to the host; prints the ho
 | `CCU_AUDIT` | `1` | `0` turns off logging (and the host mirror) |
 | `CCU_AUDIT_SHOTS` | `1` | `0` turns off audit screenshots |
 | `CCU_AUDIT_MAX_SHOTS` | `500` | screenshots to keep, oldest deleted first (`0` = no limit) |
-| `CCU_AUDIT_TYPE` | `length` | how `type` text is logged: `length`, `hash` or `full` |
+| `CCU_AUDIT_TYPE` | `length` | how `type` text and clipboard contents are logged: `length`, `hash` or `full` |
 | `CCU_AUDIT_MIRROR` | `~/.local/state/ccu/audit/<name>.jsonl` | host mirror file, or `off` |
 | `CCU_RECORD_FPS` | `5` | recording frame rate |
 
