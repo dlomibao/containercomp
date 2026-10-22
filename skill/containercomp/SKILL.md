@@ -11,7 +11,7 @@ Two targets:
 - `native` (default): an arm64 desktop. It's fast. Use it for anything that has an arm64 Linux build.
 - `x86` (`ccu -t x86 ...` or `CCU_TARGET=x86`): an amd64 desktop under emulation, with Wine. Use it for x86-only Linux binaries and Windows `.exe`/`.msi` files. It's noticeably slower, so allow longer waits.
 
-Every command below takes `-t x86` right after `ccu` to address the x86 desktop.
+Every command below takes `-t x86` right after `ccu` to address the x86 desktop, or `-n NAME` to address a named desktop (see "Several desktops" below).
 
 ## Start up
 
@@ -20,7 +20,21 @@ ccu status                 # is it built/running?
 ccu up                     # builds the image on first run (several minutes), then starts it
 ```
 
-Tell the user the viewer URL (`http://localhost:6080/` for native, `:6081` for x86).
+Tell the user the viewer URL that `ccu up` prints (`http://localhost:6080/` for native and `:6081` for x86 by default; a named desktop gets the next free port).
+
+## Several desktops (parallel work)
+
+Several desktops can run at once, each with its own name, screen, viewer port, audit log and network mode. Use your own desktop when:
+- the user asks you to work in parallel, or you are one of several agents or subagents using `ccu`;
+- the user asks for a separate or throwaway desktop, or for tests that shouldn't disturb the one they're watching.
+
+Then:
+1. Run `ccu ls` to see which desktops exist. Don't use or change one you didn't create unless the user pointed you at it.
+2. Pick a short, unused name for your task, such as `ccu-review-pr12` or `tests-2` (letters, digits, `.`, `_`, `-`), and create it: `ccu -n NAME up` (add `--from SNAP` to start from a snapshot, `-t x86` for x86, `--offline`/`--egress FILE` for restricted network). It prints the desktop's own viewer URL.
+3. **Pass `-n NAME` on every command**, right after `ccu`: `ccu -n NAME screenshot`, `ccu -n NAME click 300 200 --shot`. A command without `-n` goes to the default `ccu` desktop, which may be someone else's. The desktop remembers whether it is x86, so `-t` is only needed with `up`.
+4. When done, stop it with `ccu -n NAME down`, or remove it with `ccu -n NAME rm` if it was a throwaway desktop for this task and the user doesn't need its state. Never remove or reset desktops you didn't create without asking.
+
+Snapshots are shared by every desktop of the same image, so `ccu -n NAME up --from golden` gives each parallel run an identical starting point. With MCP, each desktop needs its own server: `claude mcp add ccu-NAME -- ccu -n NAME mcp`.
 
 ## Install apps
 
@@ -135,4 +149,4 @@ The user can start the desktop with limited network access: `ccu up --egress all
 
 ## MCP alternative
 
-The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.
+The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. A server drives one desktop (the default one here); for a named desktop, use the server registered for it (`mcp__ccu-NAME__*`) or the CLI with `-n NAME`. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.
