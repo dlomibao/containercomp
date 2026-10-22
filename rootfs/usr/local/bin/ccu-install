@@ -2,6 +2,7 @@
 # ccu-install: install apps into the container. Runs as root.
 #
 #   ccu-install <apt-package>...          apt packages
+#   ccu-install firefox|chromium|google-chrome   browser debs from vendor/PPA repos
 #   ccu-install /path/to/file.deb          local .deb (dependencies resolved by apt)
 #   ccu-install /path/to/App.AppImage      AppImage -> /usr/local/bin/<name>
 #   ccu-install /path/to/setup.exe|.msi    run the Windows installer under Wine (GUI)
@@ -35,6 +36,119 @@ stem() {
     echo "${base%.*}"
 }
 
+# Command name for an app file: "Obsidian-1.14.4-arm64" -> obsidian,
+# "nvim-linux-arm64" -> nvim. Drops version numbers and platform words.
+slug() {
+    local s
+    s=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | tr -s '-' | tr '-' '\n' \
+        | grep -vxE '(v?[0-9]+|linux|x86|x64|amd64|arm64|aarch64|armhf|i386|i686|appimage)?' | paste -sd- -) || true
+    [ -n "$s" ] || s=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-' | sed 's/^-*//; s/-*$//')
+    echo "$s"
+}
+
+# Unpack an AppImage once, into /opt/appimages/<cmd>, with unsquashfs, and make
+# <cmd> run its AppRun. Running the AppImage itself needs FUSE (missing in a
+# container), and its extract-and-run mode unpacks the whole app on every start
+# and needs whatever libraries the AppImage's runtime links (some want libz.so).
+install_appimage() {
+    local f=$1 cmd dir offset
+    cmd=$(slug "$2")
+    dir=/opt/appimages/$cmd
+    chmod +x "$f"
+    command -v unsquashfs >/dev/null || { apt_ready; apt-get install -y -q --no-install-recommends squashfs-tools >/dev/null; }
+    # The squashfs image starts right after the ELF runtime's section headers.
+    offset=$(python3 -c 'import struct, sys
+h = open(sys.argv[1], "rb").read(64)
+assert h[:4] == b"\x7fELF"
+shoff, = struct.unpack_from("<Q" if h[4] == 2 else "<I", h, 40 if h[4] == 2 else 32)
+shentsize, shnum = struct.unpack_from("<HH", h, 58 if h[4] == 2 else 46)
+print(shoff + shentsize * shnum)' "$f" 2>/dev/null) || offset=""
+    mkdir -p /opt/appimages
+    rm -rf "$dir.new"
+    if [ -n "$offset" ] && unsquashfs -q -no-xattrs -o "$offset" -d "$dir.new" "$f" >/dev/null && [ -e "$dir.new/AppRun" ]; then
+        rm -rf "$dir"
+        mv "$dir.new" "$dir"
+        chown -R root:root "$dir"
+        chmod -R a+rX,go-w "$dir"
+        cat > "/usr/local/bin/$cmd" <<EOF
+#!/bin/sh
+APPDIR="$dir" APPIMAGE="$f" ARGV0="$cmd" exec "$dir/AppRun" "\$@"
+EOF
+        echo "installed AppImage to $dir: run with \`$cmd\`"
+    else
+        # Not a squashfs AppImage (type 1, or unusual): run it in extract-and-run mode.
+        rm -rf "$dir.new"
+        cat > "/usr/local/bin/$cmd" <<EOF
+#!/bin/sh
+APPIMAGE_EXTRACT_AND_RUN=1 exec "$f" "\$@"
+EOF
+        echo "installed AppImage (could not unpack it, runs in extract-and-run mode): run with \`$cmd\`"
+    fi
+    chmod +x "/usr/local/bin/$cmd"
+}
+
+# Fetch an apt signing key over HTTPS and install it at DEST only if it has the
+# expected fingerprint: add_key URL FINGERPRINT DEST.
+add_key() {
+    local tmp
+    tmp=$(mktemp -d)
+    curl -fsSL "$1" -o "$tmp/key"
+    if ! GNUPGHOME=$tmp gpg --show-keys --with-colons "$tmp/key" 2>/dev/null | grep -q "^fpr:*$2:"; then
+        rm -rf "$tmp"
+        echo "ccu-install: the signing key from $1 doesn't have the expected fingerprint $2" >&2
+        return 1
+    fi
+    install -D -m 0644 "$tmp/key" "$3"
+    rm -rf "$tmp"
+}
+
+# Ubuntu's firefox and chromium packages are snap stubs, and snaps don't run in
+# a container. Install real debs from the sources below instead.
+install_browser() {
+    local key
+    case "$1" in
+        firefox)
+            # Mozilla's own repository (amd64 and arm64), as Mozilla documents it.
+            key=/etc/apt/keyrings/packages.mozilla.org.asc
+            add_key https://packages.mozilla.org/apt/repo-signing-key.gpg 35BAA0B33E9EB396F59CA838C0BA5CE6DC6315A3 "$key"
+            echo "deb [signed-by=$key] https://packages.mozilla.org/apt mozilla main" > /etc/apt/sources.list.d/mozilla.list
+            printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' > /etc/apt/preferences.d/mozilla
+            apt-get update -q
+            apt-get install -y --no-install-recommends firefox
+            ;;
+        chromium|chromium-browser)
+            # Google publishes no Linux arm64 build, and Ubuntu only a snap. The
+            # xtradeb PPA builds Chromium debs for Ubuntu (amd64 and arm64). Pin
+            # it so that nothing but Chromium comes from it.
+            key=/etc/apt/keyrings/xtradeb.asc
+            add_key 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x5301FA4FD93244FBC6F6149982BB6851C64F6880' \
+                5301FA4FD93244FBC6F6149982BB6851C64F6880 "$key"
+            echo "deb [signed-by=$key] https://ppa.launchpadcontent.net/xtradeb/apps/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") main" \
+                > /etc/apt/sources.list.d/xtradeb.list
+            printf '%s\n' 'Package: *' 'Pin: release o=LP-PPA-xtradeb-apps' 'Pin-Priority: -1' '' \
+                'Package: chromium chromium-common chromium-sandbox chromium-l10n chromium-driver' \
+                'Pin: release o=LP-PPA-xtradeb-apps' 'Pin-Priority: 700' > /etc/apt/preferences.d/xtradeb
+            apt-get update -q
+            apt-get install -y --no-install-recommends chromium libnss3-tools
+            ;;
+        google-chrome|google-chrome-stable)
+            if [ "$(dpkg --print-architecture)" != amd64 ]; then
+                echo "ccu-install: Google Chrome has no Linux $(dpkg --print-architecture) build; use \`ccu install chromium\` or the x86 target" >&2
+                return 1
+            fi
+            # The same files Chrome's own package maintains, so they don't conflict.
+            add_key https://dl.google.com/linux/linux_signing_key.pub EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796 \
+                /etc/apt/trusted.gpg.d/google-chrome.asc
+            echo "deb [arch=amd64] https://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
+            apt-get update -q
+            apt-get install -y --no-install-recommends google-chrome-stable libnss3-tools
+            ;;
+    esac
+    # Trust CAs that `ccu certs` added before the browser was installed.
+    if [ -d /usr/local/share/ca-certificates/ccu ]; then /opt/ccu/bin/netsetup browsers || true; fi
+}
+
+
 install_file() {
     local f=$1 lower name
     lower=$(echo "$f" | tr '[:upper:]' '[:lower:]')
@@ -46,16 +160,7 @@ install_file() {
             echo "installed $(basename "$f")"
             ;;
         *.appimage)
-            chmod +x "$f"
-            local slug
-            slug=$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/-[0-9].*$//; s/^-//; s/-$//')
-            # Extract-and-run avoids needing FUSE inside the container.
-            cat > "/usr/local/bin/$slug" <<EOF
-#!/bin/sh
-APPIMAGE_EXTRACT_AND_RUN=1 exec "$f" "\$@"
-EOF
-            chmod +x "/usr/local/bin/$slug"
-            echo "installed AppImage: run with \`$slug\` (Electron apps may need --no-sandbox)"
+            install_appimage "$f" "$name"
             ;;
         *.exe|*.msi)
             if ! command -v wine >/dev/null; then
@@ -72,15 +177,24 @@ EOF
             echo "started Windows installer under Wine; finish it on the desktop (log: ~/.cache/ccu/wine-install.log)"
             ;;
         *.tar.gz|*.tgz|*.tar.xz|*.tar.bz2|*.tar|*.zip|*.7z)
-            local dest="$APPS/$name"
-            mkdir -p "$dest"
+            local dest="$APPS/$name" tmp top
+            tmp=$(mktemp -d "$APPS/.extract.XXXXXX")
             case "$lower" in
-                *.zip) unzip -q -o "$f" -d "$dest" ;;
-                *.7z) 7z x -y -o"$dest" "$f" >/dev/null ;;
-                *) tar -xf "$f" -C "$dest" ;;
+                *.zip) unzip -q -o "$f" -d "$tmp" ;;
+                *.7z) 7z x -y -o"$tmp" "$f" >/dev/null ;;
+                *) tar -xf "$f" -C "$tmp" --no-same-owner ;;
             esac
+            # Most archives hold one top-level folder; use its contents, so the
+            # app isn't nested twice (~/apps/foo/foo/...).
+            top=$(ls -A "$tmp")
+            if [ "$(echo "$top" | wc -l)" = 1 ] && [ -d "$tmp/$top" ] && [ ! -L "$tmp/$top" ]; then top=$tmp/$top; else top=$tmp; fi
+            mkdir -p "$dest"
+            cp -a "$top/." "$dest/"
+            rm -rf "$tmp"
             chown -R "$USER_NAME:$USER_NAME" "$dest"
             echo "extracted to $dest"
+            # Point at the likely program(s), since archives don't say how to start.
+            find "$dest" -maxdepth 3 -type f -perm -u+x ! -name '*.so*' 2>/dev/null | sort | head -n 5 | sed 's/^/  executable: /' || true
             ;;
         *)
             echo "copied to $f"
@@ -89,7 +203,7 @@ EOF
 }
 
 if [ "$#" -eq 0 ]; then
-    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
     exit 1
 fi
 
@@ -99,11 +213,13 @@ for arg in "$@"; do
         fname=$(basename "${arg%%\?*}")
         [ -n "$fname" ] || fname=download
         echo "downloading $arg"
-        curl -fL --retry 2 -o "$APPS/$fname" "$arg"
+        curl -fsSL --retry 2 -o "$APPS/$fname" "$arg"
         chown "$USER_NAME:$USER_NAME" "$APPS/$fname"
         install_file "$APPS/$fname"
     elif [ -f "$arg" ]; then
         install_file "$arg"
+    elif [[ "$arg" =~ ^(firefox|chromium|chromium-browser|google-chrome|google-chrome-stable)$ ]]; then
+        install_browser "$arg"
     else
         pkgs+=("$arg")
     fi

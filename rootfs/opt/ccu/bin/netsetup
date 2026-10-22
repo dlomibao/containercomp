@@ -5,6 +5,8 @@
                    everywhere below; empty input removes the ones added before
   netsetup proxy   point apt (and sudo) at the proxy from the container env
   netsetup apply   both; `ccu up` runs this
+  netsetup browsers  redo the Firefox and Chrome steps for the CAs already
+                   trusted (ccu-install runs this after installing a browser)
 
 Trust stores covered by `certs`:
   - the system store (update-ca-certificates): curl, wget, apt, Python ssl,
@@ -120,7 +122,12 @@ def certs(data):
         for n in sorted(names):
             print(f"  {names[n]}")
 
-    paths = sorted(os.path.join(CA_DIR, n) for n in wanted)
+    browsers(sorted(os.path.join(CA_DIR, n) for n in wanted))
+
+
+def browsers(paths=None):
+    if paths is None:
+        paths = sorted(glob.glob(CA_DIR + "/*.crt"))
     firefox_policy(paths)
     nssdb(paths)
 
@@ -211,7 +218,7 @@ def proxy():
 
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
-    if cmd not in ("certs", "proxy", "apply"):
+    if cmd not in ("certs", "proxy", "apply", "browsers"):
         print(__doc__.strip(), file=sys.stderr)
         sys.exit(2)
     if os.geteuid() != 0:
@@ -220,6 +227,8 @@ def main():
         certs(sys.stdin.read())
     if cmd in ("proxy", "apply"):
         proxy()
+    if cmd == "browsers":
+        browsers()
 
 
 if __name__ == "__main__":
