@@ -16,6 +16,18 @@ TARGET=${CCU_TARGET:-native}
 SHOT_DIR=${CCU_SHOT_DIR:-${TMPDIR:-/tmp}/ccu}
 SCREEN=${CCU_SCREEN:-1280x800}
 
+# Audit log settings forwarded to cu in the container (`-e VAR` passes VAR only
+# if it is set here), and the host-side mirror of the log's entries.
+AUDIT_LOG=/var/log/ccu/audit/audit.jsonl
+AUDIT_ENV=(-e CCU_AUDIT_SOURCE=cli -e CCU_AUDIT -e CCU_AUDIT_SHOTS -e CCU_AUDIT_MAX_SHOTS
+           -e CCU_AUDIT_TYPE -e CCU_AUDIT_SHOT_DELAY -e CCU_RECORD_FPS)
+AUDIT_MIRROR=${CCU_AUDIT_MIRROR:-default}
+case "${CCU_AUDIT:-1}:$AUDIT_MIRROR" in
+    0:*|*:0) AUDIT_MIRROR=off ;;
+    *:off) ;;
+    *) AUDIT_ENV+=(-e CCU_AUDIT_ECHO=1) ;;
+esac
+
 usage() {
     cat <<'EOF'
 ccu: a Linux desktop in a Podman container, driven by mouse/keyboard/screenshots.
@@ -72,8 +84,18 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
+Audit and recording (every action is logged; see README "Audit and recording")
+  audit tail [N]        last N audit log entries (JSONL)
+  audit verify          check the log's hash chain and compare it with the host mirror
+  audit export [DIR]    copy the log, its screenshots and an HTML timeline to the host
+  record start [FILE]   record the screen with ffmpeg (5 fps .mp4) until `record stop`
+  record stop           finish the recording, copy it to the host, print its path
+  record status
+
 Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_NAME,
 CCU_IMAGE, CCU_SHOT_DIR, VNC_PASSWORD (applied when the container is created).
+Audit: CCU_AUDIT (1|0), CCU_AUDIT_SHOTS (1|0), CCU_AUDIT_MAX_SHOTS (500),
+CCU_AUDIT_TYPE (length|hash|full), CCU_AUDIT_MIRROR (host file or off), CCU_RECORD_FPS (5).
 EOF
 }
 
@@ -94,10 +116,25 @@ require_running() {
     [ "$(state)" = running ] || die "container '$NAME' is not running; start it with: ccu${TARGET_FLAG} up"
 }
 
-# podman exec as the desktop user with the display env.
+# podman exec as the desktop user with the display env (and audit settings).
 pexec() {
-    podman exec -u user -w /home/user -e DISPLAY=:1 "$NAME" "$@"
+    if [ "$AUDIT_MIRROR" = off ]; then
+        podman exec -u user -w /home/user -e DISPLAY=:1 "${AUDIT_ENV[@]}" "$NAME" "$@"
+    else
+        podman exec -u user -w /home/user -e DISPLAY=:1 "${AUDIT_ENV[@]}" "$NAME" "$@" 2> >(audit_tee)
+    fi
 }
+
+# Container stderr filter: audit entries (lines starting "ccu-audit<TAB>") are
+# appended to the host mirror; everything else passes through to stderr.
+audit_tee() {
+    mkdir -p "$(dirname "$AUDIT_MIRROR")" 2>/dev/null || true
+    awk -v f="$AUDIT_MIRROR" 'index($0, "ccu-audit\t") == 1 { print substr($0, 11) >> f; fflush(f); next }
+        { print > "/dev/stderr"; fflush("/dev/stderr") }'
+}
+
+# Log a host-side event (file copies, interactive shells) in the audit log.
+audit_note() { pexec cu audit note "$@" >/dev/null || true; }
 
 ensure_machine() {
     # On macOS podman needs its Linux VM running.
@@ -252,7 +289,7 @@ cmd_install() {
             targets+=("$a")
         fi
     done
-    podman exec -e DISPLAY=:1 "$NAME" /usr/local/bin/ccu-install "${targets[@]}"
+    pexec cu exec --root --action install -- /usr/local/bin/ccu-install "${targets[@]}"
 }
 
 cmd_cp_in() {
@@ -260,6 +297,7 @@ cmd_cp_in() {
     local dest=${2:-/home/user/apps/}
     podman exec "$NAME" mkdir -p /home/user/apps
     podman cp "$1" "$NAME:$dest"
+    audit_note cp-in "host=$1" "dest=$dest"
     podman exec "$NAME" chown -R user:user /home/user/apps
     case "$dest" in /home/user/*) podman exec "$NAME" chown -R user:user "$dest" ;; esac
     echo "copied to $dest"
@@ -270,6 +308,74 @@ cmd_cp_out() {
     local src=$1
     case "$src" in /*) ;; *) src=/home/user/$src ;; esac
     podman cp "$NAME:$src" "${2:-.}"
+    audit_note cp-out "src=$src" "host=${2:-.}"
+}
+
+# --- audit log and session recording -------------------------------------------
+
+cmd_audit() {
+    local sub=${1:-}
+    [ $# -eq 0 ] || shift
+    case "$sub" in
+        tail) pexec tail -n "${1:-20}" "$AUDIT_LOG" ;;
+        verify) audit_verify ;;
+        export) audit_export "$@" ;;
+        *) die "usage: ccu audit tail [N] | verify | export [DIR]" ;;
+    esac
+}
+
+audit_verify() {
+    local rc=0 tmp start missing extra
+    pexec cu audit verify || rc=1
+    if [ "$AUDIT_MIRROR" = off ] || [ ! -s "$AUDIT_MIRROR" ]; then
+        echo "host mirror: none"
+        return $rc
+    fi
+    tmp=$(mktemp -d)
+    podman exec "$NAME" cat "$AUDIT_LOG" > "$tmp/log" 2>/dev/null || true
+    # Compare from the mirror's last seq-1 entry; earlier ones are from removed containers.
+    start=$(grep -n '^{"seq":1,' "$AUDIT_MIRROR" | tail -n 1 | cut -d: -f1)
+    tail -n +"${start:-1}" "$AUDIT_MIRROR" > "$tmp/mirror"
+    missing=$(grep -cvxFf "$tmp/log" "$tmp/mirror" || true)
+    extra=$(grep -cvxFf "$tmp/mirror" "$tmp/log" || true)
+    rm -rf "$tmp"
+    echo "host mirror $AUDIT_MIRROR: $missing mirrored entries missing or changed in the container log, $extra container entries not mirrored"
+    [ "$missing" = 0 ] || rc=1
+    return $rc
+}
+
+audit_export() {
+    local dir=${1:-$SHOT_DIR/audit-$NAME-$(date +%Y%m%d-%H%M%S)}
+    mkdir -p "$dir"
+    pexec cu audit html >/dev/null
+    podman cp "$NAME:/var/log/ccu/audit/." "$dir/"
+    if [ "$AUDIT_MIRROR" != off ] && [ -f "$AUDIT_MIRROR" ]; then
+        cp "$AUDIT_MIRROR" "$dir/host-mirror.jsonl"
+    fi
+    audit_verify > "$dir/verify.txt" 2>&1 || echo "ccu: verification found problems, see $dir/verify.txt" >&2
+    echo "$(cd "$dir" && pwd)/index.html"
+}
+
+cmd_record() {
+    local f out src dest
+    case "${1:-status}" in
+        start)
+            f=${2:-$SHOT_DIR/$NAME-$(date +%Y%m%d-%H%M%S).mp4}
+            case "$f" in /*) ;; *) f=$PWD/$f ;; esac
+            mkdir -p "$(dirname "$f")"
+            pexec cu record start --host-path "$f"
+            echo "run 'ccu${TARGET_FLAG} record stop' to finish; it will be saved to $f"
+            ;;
+        stop)
+            out=$(pexec cu record stop)
+            IFS=$'\t' read -r src dest <<< "$out"
+            [ -n "$dest" ] || dest=$SHOT_DIR/$(basename "$src")
+            podman cp "$NAME:$src" "$dest"
+            echo "$dest"
+            ;;
+        status) pexec cu record status ;;
+        *) die "usage: ccu record start [FILE.mp4] | stop | status" ;;
+    esac
 }
 
 # --- snapshots ----------------------------------------------------------------
@@ -477,6 +583,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 set_target
+[ "$AUDIT_MIRROR" != default ] || AUDIT_MIRROR=${XDG_STATE_HOME:-$HOME/.local/state}/ccu/audit/$NAME.jsonl
 [ $# -gt 0 ] || { usage; exit 1; }
 cmd=$1; shift
 
@@ -507,24 +614,29 @@ case "$cmd" in
         ;;
     shell)
         require_running
+        audit_note shell "root=$([ "${1:-}" = --root ] && echo 1 || echo 0)"
         if [ "${1:-}" = --root ]; then podman exec -it -e DISPLAY=:1 "$NAME" bash
         else podman exec -it -u user -w /home/user -e DISPLAY=:1 "$NAME" bash -l; fi
         ;;
     exec)
         require_running
-        if [ "${1:-}" = --root ]; then shift; podman exec -e DISPLAY=:1 "$NAME" "$@"
-        else pexec "$@"; fi
+        if [ "${1:-}" = --root ]; then shift; pexec cu exec --root -- "$@"
+        else pexec cu exec -- "$@"; fi
         ;;
     mcp)
         # Don't auto-start: Claude Code spawns MCP servers at every session start.
         require_running
-        exec podman exec -i -u user -w /home/user -e DISPLAY=:1 "$NAME" /opt/ccu/venv/bin/python /opt/ccu/mcp_server.py
+        set -- podman exec -i -u user -w /home/user -e DISPLAY=:1 "${AUDIT_ENV[@]}" "$NAME" /opt/ccu/venv/bin/python /opt/ccu/mcp_server.py
+        if [ "$AUDIT_MIRROR" = off ]; then exec "$@"; fi
+        exec "$@" 2> >(audit_tee)
         ;;
     install) require_running; cmd_install "$@" ;;
     cp-in) require_running; cmd_cp_in "$@" ;;
     cp-out) require_running; cmd_cp_out "$@" ;;
     screenshot) require_running; cmd_screenshot "$@" ;;
     zoom) require_running; cmd_zoom "$@" ;;
+    audit) require_running; cmd_audit "$@" ;;
+    record) require_running; cmd_record "$@" ;;
     click|double_click|triple_click|right_click|middle_click|move|mouse_down|mouse_up|drag|scroll|type|key|launch|focus|wait_window|wait|windows|active|size|cursor)
         require_running
         pexec cu "$cmd" "$@"

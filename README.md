@@ -58,6 +58,7 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             type TEXT   key COMBO...   launch CMD...   windows | active | size | cursor
             focus TITLE   wait_window TITLE [--timeout S]   wait S
             (append --shot to any screen command to screenshot afterwards)
+Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
 ```
 
 `ccu screenshot` saves a PNG and prints its path, which Claude then reads. Screenshots are at native resolution (default 1280x800), so a pixel in the screenshot is the pixel you click.
@@ -94,6 +95,47 @@ claude mcp add -s user containercomp -- ccu mcp
 ```
 
 Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`.
+
+## Audit and recording
+
+Every action is logged, whether it comes from the CLI or the MCP server: clicks, moves, drags, scrolls, typing, keys, launches, focus changes, `install`, `exec`, MCP `shell`, file copies and recordings. Screenshots and zooms are logged as observations. The log is JSONL at `/var/log/ccu/audit/audit.jsonl` in the container, one entry per line:
+
+```json
+{"seq":8,"ts":"2026-10-22T04:15:55.509Z","source":"cli","kind":"action","action":"type",
+ "args":{"text":{"redacted":"length","len":31},"delay_ms":12},"ok":true,"result":null,"error":null,
+ "window":"Untitled 1 - Mousepad","shot":"shots/00000008-type.png","ms":237,"prev":"a5a88ec2…"}
+```
+
+- `source` is `cli` (through `ccu`), `mcp`, or `container` (`cu` run directly inside the container). `kind` is `action`, `observation` or `command`. `ts` is when the action started, `ms` how long it took, and `window` the active window title at that moment.
+- `shot` is a screenshot taken about 0.5 s after each state-changing action (2 s after `launch`), in the background so the action isn't slowed down. For screenshots and zooms it is a copy of the image the agent saw. Only the newest 500 screenshots are kept (`CCU_AUDIT_MAX_SHOTS`); older ones are deleted, and their entries stay in the log. In testing, screenshots were 20 to 100 KB; busier screens are larger.
+- **Typed text is redacted by default**: `type` entries record only the length. `CCU_AUDIT_TYPE=hash` adds a sha256 of the text, so you can check whether a known value was typed, but short secrets can be brute-forced from it. `CCU_AUDIT_TYPE=full` logs the text itself. Screenshots still show whatever text appears on screen, so turn them off (`CCU_AUDIT_SHOTS=0`) for sessions that handle secrets. `exec`, `shell` and `launch` commands are logged in full, with the last 1000 characters of `exec` and `shell` output.
+
+```bash
+ccu audit tail 20             # last entries
+ccu audit verify              # check the hash chain and compare with the host mirror
+ccu audit export [DIR]        # copy the log + screenshots to the host, with index.html (a timeline)
+ccu record start [FILE.mp4]   # screen video with ffmpeg x11grab (5 fps, H.264)
+ccu record stop               # finish it and copy it to the host; prints the host path
+```
+
+`ccu audit export` writes `audit.jsonl`, `shots/`, a static `index.html` timeline (actions next to their screenshots), the host mirror and the verification result to `DIR` (default `$CCU_SHOT_DIR/audit-<name>-<time>`). A recording costs about 4% of a CPU core and around 150 MB of RAM. An idle desktop compresses to roughly 100 KB per minute. Recordings go to `$CCU_SHOT_DIR` unless you give a file, and a copy stays in `/var/log/ccu/rec/` in the container. Stopping the container mid-recording loses that recording. ffmpeg adds about 130 MB to the native image.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `CCU_AUDIT` | `1` | `0` turns off logging (and the host mirror) |
+| `CCU_AUDIT_SHOTS` | `1` | `0` turns off audit screenshots |
+| `CCU_AUDIT_MAX_SHOTS` | `500` | screenshots to keep, oldest deleted first (`0` = no limit) |
+| `CCU_AUDIT_TYPE` | `length` | how `type` text is logged: `length`, `hash` or `full` |
+| `CCU_AUDIT_MIRROR` | `~/.local/state/ccu/audit/<name>.jsonl` | host mirror file, or `off` |
+| `CCU_RECORD_FPS` | `5` | recording frame rate |
+
+`ccu` reads these on every command and passes them into the container. For the MCP server, set them when you register it, for example `claude mcp add -s user containercomp -e CCU_AUDIT_TYPE=hash -- ccu mcp`.
+
+**This is tamper-evident at best, not tamper-proof.** The agent has root inside the container and can rewrite or delete the log, and it can set `CCU_AUDIT=0` on its own commands. Two measures make that visible:
+- Each entry carries the sha256 of the previous line (`prev`), so editing or deleting an entry in the middle breaks the chain.
+- `ccu` mirrors each entry to a host file as it is written (it travels on the `podman exec` stderr stream), and `ccu audit verify` reports mirrored entries that are missing or changed in the container. Anything that bypasses `ccu`, such as a plain `podman exec` or `cu` run from a shell inside the container, is not mirrored and may not be logged.
+
+An agent that can also run arbitrary commands on the host can edit the mirror too. For real assurance, ship the mirror somewhere the agent can't write.
 
 ## Snapshots and clean-state resets
 
@@ -147,6 +189,7 @@ Containerfile                 image definition (one file, both targets)
 bin/ccu                       host CLI
 rootfs/opt/ccu/cu.py          in-container control library + CLI (`cu`)
 rootfs/opt/ccu/mcp_server.py  MCP server (FastMCP, stdio)
+rootfs/opt/ccu/ccu_audit.py   audit log, `cu exec`, screen recording
 rootfs/usr/local/bin/ccu-install   app installer (apt/deb/AppImage/Wine/archives)
 rootfs/etc/supervisor/conf.d/ccu.conf  Xvfb, XFCE, x11vnc, noVNC
 skill/containercomp/SKILL.md  Claude Code skill

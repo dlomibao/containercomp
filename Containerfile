@@ -39,6 +39,10 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ] && [ "$WITH_WINE" = "1" ]; t
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
+# Session recording (`ccu record`): ffmpeg with x11grab and libx264.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
 # Python env for the MCP server.
 RUN python3 -m venv --system-site-packages /opt/ccu/venv \
     && /opt/ccu/venv/bin/pip install --no-cache-dir "mcp>=1.2,<2"
