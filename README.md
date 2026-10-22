@@ -100,6 +100,40 @@ Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scro
 podman commit ccu localhost/containercomp:native   # overwrite the base image with the current state
 ```
 
+## Corporate networks
+
+Behind a TLS-inspecting proxy (Zscaler, Netskope, Palo Alto, ...), your Mac trusts the company's root CA but the container doesn't, so apt, pip, curl and browsers fail with certificate errors. `ccu` copies that trust into the container instead of turning verification off:
+
+```bash
+ccu certs sync          # macOS: export the extra roots your Mac trusts (admin/MDM/user)
+ccu certs add corp.pem  # any host: trust a CA file (PEM or DER) that IT gave you
+ccu certs list          # what is stored; ccu certs rm NAME removes one
+ccu up                  # new containers get them; a running one is updated right away
+```
+
+- **What `sync` exports:** self-signed CA roots from `/Library/Keychains/System.keychain` and your user keychains that macOS trusts for TLS (checked with `security verify-cert`, so admin and MDM trust settings count) and that are not Apple built-in roots. Public CAs are already in Ubuntu's bundle, so in practice this is just your company's root. Certs Ubuntu already trusts are skipped again inside the container. Run it again after IT rotates the root. If your proxy needs an intermediate it doesn't send, add it with `ccu certs add`.
+- **Where they go:** `~/.config/containercomp/certs/` (`CCU_CERT_DIR`), plus any files in `CCU_CA_FILE` (colon-separated, not copied). They're applied on every `ccu up`, by `certs add/rm/sync/apply` to the running container, and to `ccu build`, so the image's own `pip install` works behind the proxy.
+- **What trusts them inside:**
+
+  | Tool | How |
+  |---|---|
+  | curl, wget, apt, Python `ssl`/urllib (and, untested, git, Wine and Java via ca-certificates-java) | system store (`update-ca-certificates`) |
+  | Python requests/httpx/pip (certifi) | `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `PIP_CERT` point at the system bundle |
+  | Node.js (incl. nodejs.org/nvm builds) | `NODE_EXTRA_CA_CERTS` points at the system bundle |
+  | Firefox (deb or tarball) | enterprise policy `/etc/firefox/policies/policies.json` |
+  | Chrome, Chromium, Electron | `~/.pki/nssdb`, which needs certutil: `ccu install libnss3-tools && ccu certs apply` (also after installing a browser later) |
+
+  The env variables are set in the image, so containers from images built before this feature need `ccu build` and a new container (`ccu rm && ccu up`) for the Python certifi and Node cases; the system store, Firefox and NSS work on older containers too. Tools with their own pinned bundle (some Java apps with a private keystore, a few Electron apps) may still need their own configuration.
+
+**Proxy.** If `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY` (either case) are set when the container is created, `ccu up` passes them in, in both cases, and writes them to apt's config and sudo's `env_keep`, so `sudo apt` works too. `ccu build` passes them as build args. A proxy on `localhost`/`127.0.0.1` on your Mac (a local PAC helper or forwarding proxy, for example) is rewritten to `host.containers.internal`, which is how the container reaches the Mac. `localhost` and `host.containers.internal` are added to `NO_PROXY`. Proxy settings are fixed when the container is created, so after changing them run `ccu rm && ccu up`. Set `CCU_PROXY=0` to pass nothing (that also stops Podman's own proxy passthrough). PAC files aren't evaluated, so point `HTTPS_PROXY` at the actual proxy.
+
+**Pulling the base image (`podman pull`) behind the proxy.** That runs in the Podman VM, which has its own trust store. Opt in with:
+
+```bash
+ccu certs sync --machine   # or: ccu certs apply --machine
+```
+
+It installs the same CAs as `/etc/pki/ca-trust/source/anchors/containercomp.pem` in the VM and runs `update-ca-trust`. It changes the VM that every Podman container on your Mac shares, which is why it never happens implicitly. If pulls still fail, restart the VM (this stops all containers): `podman machine stop && podman machine start`.
 ## Notes and limits
 
 - **Snaps don't work in containers.** That includes Ubuntu's `firefox` and `chromium` apt packages. Use vendor repos, tarballs or AppImages instead.

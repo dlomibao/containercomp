@@ -41,6 +41,17 @@ Watch for these:
 - Electron and Chromium-based apps usually need `--no-sandbox`.
 - To find the binary a package installed, run `ccu exec dpkg -L <pkg> | grep bin/`.
 
+## Certificate errors and proxies (corporate networks)
+
+If downloads in the container fail with `certificate verify failed`, `SSL certificate problem` or `unable to get local issuer certificate` while the same URL works on the Mac, the user is probably behind a TLS-inspecting proxy. Don't turn verification off (`-k`, `--trusted-host`, `verify=False`). Instead:
+
+```bash
+ccu certs sync             # trust the extra roots the Mac trusts (applies to the running container)
+ccu certs add ~/corp.pem   # or a CA file the user names
+```
+
+For Chrome/Chromium, also run `ccu install libnss3-tools && ccu certs apply`. Proxy variables are only picked up when the container is created, so if `HTTPS_PROXY` changed, a `ccu rm && ccu up` is needed (ask first). `ccu certs sync --machine` changes the shared Podman VM; run it only when the user asks, for `podman pull` failures.
+
 ## The control loop
 
 1. **Look.** Run `ccu screenshot`. It prints a PNG path. Read that file with the Read tool to see the screen.

@@ -44,6 +44,16 @@ Apps and files
   cp-in HOST [DEST]     copy a host file into the container (default ~/apps/)
   cp-out SRC [HOST]     copy a container file to the host (default: current dir)
 
+Corporate networks (TLS-inspecting proxies such as Zscaler or Netskope)
+  certs sync [--machine]   copy the extra roots macOS trusts (keychains, MDM) for
+                        the container; --machine also trusts them in the podman VM
+                        (for podman pull; changes the VM shared by all containers)
+  certs add FILE [NAME] trust a CA file (PEM or DER); for non-mac hosts too
+  certs rm NAME | certs list | certs apply   (apply re-pushes to the running one)
+  Stored certs apply on every `up`, to the running container, and to `build`.
+  HTTP(S)_PROXY / NO_PROXY from your shell are passed in when the container is
+  created (localhost becomes host.containers.internal); CCU_PROXY=0 disables.
+
 Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
   screenshot [FILE]     save a PNG, print its path
   zoom X0 Y0 X1 Y1 [--scale N] [FILE]   enlarged crop of a region
@@ -63,7 +73,8 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
 Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_SHOT_DIR,
-VNC_PASSWORD (applied when the container is created).
+VNC_PASSWORD (applied when the container is created), CCU_CA_FILE (extra CA
+files, colon-separated), CCU_CERT_DIR (default ~/.config/containercomp/certs).
 EOF
 }
 
@@ -101,7 +112,12 @@ ensure_machine() {
 cmd_build() {
     ensure_machine
     echo "building $IMAGE ($PLATFORM); the x86 build is slow under emulation" >&2
-    podman build --platform "$PLATFORM" -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
+    # Behind a TLS-inspecting proxy the build needs its CA and proxy too.
+    local ca
+    ca=$(ca_bundle)
+    proxy_opts --build-arg
+    [ -z "$ca" ] || PROXY_OPTS+=(--build-arg "CCU_EXTRA_CA=$ca")
+    podman build ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} --platform "$PLATFORM" -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
 }
 
 wait_ready() {
@@ -138,6 +154,7 @@ cmd_up() {
         missing)
             podman image exists "$IMAGE" || cmd_build
             local w=${SCREEN%x*} h=${SCREEN#*x}
+            proxy_opts -e
             podman run -d --name "$NAME" --hostname "$NAME" \
                 --platform "$PLATFORM" \
                 -p "127.0.0.1:$PORT:6080" \
@@ -145,10 +162,12 @@ cmd_up() {
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
                 -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
                 --label containercomp.target="$TARGET" \
+                ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} \
                 "$IMAGE" >/dev/null
             ;;
         *) podman start "$NAME" >/dev/null ;;
     esac
+    netsetup apply
     wait_ready
     echo "desktop '$NAME' is up: $(pexec cu size | tr ' ' x) at http://localhost:$PORT/"
 }
@@ -228,6 +247,176 @@ cmd_cp_out() {
     podman cp "$NAME:$src" "${2:-.}"
 }
 
+# --- corporate networks: extra CA certificates and proxy passthrough ----------
+
+CERT_DIR=${CCU_CERT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/containercomp/certs}
+
+# Print a cert file as PEM (accepts PEM bundles and DER).
+pem_of() {
+    if grep -q 'BEGIN CERTIFICATE' "$1"; then cat "$1"
+    else openssl x509 -inform DER -in "$1" || die "$1 is not a PEM or DER certificate"; fi
+}
+
+# Every extra CA that ccu applies: the stored ones plus CCU_CA_FILE (colon-separated).
+ca_bundle() {
+    local f
+    for f in "$CERT_DIR"/*.pem; do
+        if [ -f "$f" ]; then cat "$f"; echo; fi
+    done
+    if [ -n "${CCU_CA_FILE:-}" ]; then
+        local IFS=:
+        for f in $CCU_CA_FILE; do
+            [ -f "$f" ] || die "CCU_CA_FILE: no such file: $f"
+            pem_of "$f"; echo
+        done
+    fi
+}
+
+# Self-signed CA roots that macOS trusts for TLS beyond Apple's built-in roots:
+# what an admin, MDM profile or user added (e.g. a Zscaler/Netskope root).
+keychain_roots() {
+    local tmp f fp builtin
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccu-certs.XXXXXX")
+    builtin=$(security find-certificate -a -Z /System/Library/Keychains/SystemRootCertificates.keychain \
+        | awk '/^SHA-256 hash:/ {print $3}')
+    {
+        security find-certificate -a -p /Library/Keychains/System.keychain
+        security list-keychains -d user | sed 's/^ *"//; s/" *$//' | while IFS= read -r f; do
+            security find-certificate -a -p "$f"
+        done
+    } 2>/dev/null | awk -v d="$tmp" '
+        /-----BEGIN CERTIFICATE-----/ { n++; f = sprintf("%s/%04d.pem", d, n) }
+        f { print > f }
+        /-----END CERTIFICATE-----/ { close(f); f = "" }'
+    for f in "$tmp"/*.pem; do
+        [ -f "$f" ] || continue
+        openssl x509 -in "$f" -noout -text 2>/dev/null | grep -q 'CA:TRUE' || continue
+        openssl x509 -in "$f" -noout -checkend 0 >/dev/null 2>&1 || continue
+        [ "$(openssl x509 -in "$f" -noout -subject | sed 's/^subject= *//')" = \
+          "$(openssl x509 -in "$f" -noout -issuer | sed 's/^issuer= *//')" ] || continue
+        fp=$(openssl x509 -in "$f" -noout -fingerprint -sha256 | sed 's/.*=//; s/://g')
+        case "$builtin" in *"$fp"*) continue ;; esac
+        # Trusted per the admin/user trust settings (offline). The ssl policy alone
+        # rejects public roots over CT, so it is only a fallback for roots
+        # trusted for SSL only.
+        security verify-cert -q -L -l -R offline -p basic -c "$f" >/dev/null 2>&1 \
+            || security verify-cert -q -L -l -R offline -p ssl -c "$f" >/dev/null 2>&1 || continue
+        cat "$f"
+    done
+    rm -rf "$tmp"
+}
+
+# Run the in-container helper as root with the CA bundle on stdin. Containers
+# from images that predate it get a copy.
+netsetup() {
+    podman exec "$NAME" test -x /opt/ccu/bin/netsetup \
+        || podman cp "$REPO/rootfs/opt/ccu/bin/netsetup" "$NAME:/opt/ccu/bin/netsetup"
+    ca_bundle | podman exec -i "$NAME" /opt/ccu/bin/netsetup "$1"
+}
+
+# Rewrite a proxy URL whose host is the Mac's loopback: inside the container
+# that host is host.containers.internal.
+container_url() {
+    printf '%s\n' "$1" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://)?([^@/]*@)?(localhost|127\.0\.0\.1|\[::1\])([:/]|$)#\1\2host.containers.internal\4#'
+}
+
+# Host proxy env as podman options in PROXY_OPTS; $1 is -e or --build-arg.
+# Both spellings are set because tools disagree on which one they read.
+proxy_opts() {
+    PROXY_OPTS=()
+    if [ "${CCU_PROXY:-1}" = 0 ]; then PROXY_OPTS=(--http-proxy=false); return 0; fi
+    local v V val any=0
+    for v in http_proxy https_proxy all_proxy no_proxy; do
+        V=$(echo "$v" | tr a-z A-Z)
+        val=${!v:-${!V:-}}
+        if [ "$v" = no_proxy ]; then
+            [ "$any" = 1 ] || continue
+            val=${val:+$val,}localhost,127.0.0.1,::1,host.containers.internal
+        else
+            [ -n "$val" ] || continue
+            any=1
+            val=$(container_url "$val")
+        fi
+        PROXY_OPTS+=("$1" "$v=$val" "$1" "$V=$val")
+    done
+}
+
+# Opt-in only: trust the same CAs in the podman machine VM, so `podman pull`
+# works behind the proxy. It changes the VM, which all containers share.
+machine_certs() {
+    [ "$(uname -s)" = Darwin ] || die "--machine is for the podman machine VM on macOS; on Linux, add the CA to the host trust store"
+    local n anchor=/etc/pki/ca-trust/source/anchors/containercomp.pem
+    n=$(ca_bundle | grep -c 'BEGIN CERTIFICATE' || true)
+    if [ "$n" -gt 0 ]; then
+        ca_bundle | podman machine ssh "sudo tee $anchor >/dev/null && sudo update-ca-trust"
+        echo "podman machine: trusting $n extra CA certificate(s) ($anchor)"
+    else
+        podman machine ssh "sudo rm -f $anchor && sudo update-ca-trust"
+        echo "podman machine: removed $anchor"
+    fi
+    echo "if podman pull still fails with certificate errors, restart the VM (stops every container):"
+    echo "  podman machine stop && podman machine start"
+}
+
+certs_show() {
+    echo "  $1"
+    pem_of "$2" | openssl crl2pkcs7 -nocrl -certfile /dev/stdin \
+        | openssl pkcs7 -print_certs -noout | sed -n 's/^subject= */    /p'
+}
+
+cmd_certs() {
+    local sub=${1:-list} machine=0 a f args=()
+    [ $# -eq 0 ] || shift
+    for a in "$@"; do
+        if [ "$a" = --machine ]; then machine=1; else args+=("$a"); fi
+    done
+    set -- ${args[@]+"${args[@]}"}
+    case "$sub" in
+        sync)
+            [ "$(uname -s)" = Darwin ] || die "certs sync reads the macOS keychains; elsewhere use: ccu certs add FILE.pem"
+            mkdir -p "$CERT_DIR"; f=$CERT_DIR/macos-keychain.pem
+            keychain_roots > "$f.tmp"
+            if [ -s "$f.tmp" ]; then
+                mv "$f.tmp" "$f"
+                echo "macOS keychains: $(grep -c 'BEGIN CERTIFICATE' "$f") extra trusted root(s) -> $f"
+            else
+                rm -f "$f.tmp" "$f"
+                echo "macOS keychains: no trusted roots beyond Apple's built-in ones"
+            fi
+            ;;
+        add)
+            [ $# -ge 1 ] && [ -f "$1" ] || die "usage: ccu certs add FILE.pem|FILE.crt|FILE.der [NAME]"
+            mkdir -p "$CERT_DIR"; f=$CERT_DIR/${2:-$(basename "${1%.*}")}.pem
+            pem_of "$1" > "$f.tmp"
+            grep -q 'BEGIN CERTIFICATE' "$f.tmp" || { rm -f "$f.tmp"; die "no certificate found in $1"; }
+            mv "$f.tmp" "$f"
+            echo "added $f"
+            ;;
+        rm)
+            [ $# -ge 1 ] || die "usage: ccu certs rm NAME (see: ccu certs list)"
+            [ -f "$CERT_DIR/${1%.pem}.pem" ] || die "no such cert: $1 (see: ccu certs list)"
+            rm "$CERT_DIR/${1%.pem}.pem"
+            echo "removed $1"
+            ;;
+        list)
+            echo "extra CAs in $CERT_DIR:"
+            for f in "$CERT_DIR"/*.pem; do
+                if [ -s "$f" ]; then certs_show "$(basename "${f%.pem}")" "$f"; fi
+            done
+            if [ -n "${CCU_CA_FILE:-}" ]; then
+                local IFS=:
+                for f in $CCU_CA_FILE; do certs_show "$f (CCU_CA_FILE)" "$f"; done
+            fi
+            return 0
+            ;;
+        apply) ;;
+        *) die "usage: ccu certs sync|add|rm|list|apply [--machine]" ;;
+    esac
+    if [ "$(state)" = running ]; then netsetup certs
+    else echo "'$NAME' is not running; the certs apply at the next: ccu${TARGET_FLAG} up"; fi
+    if [ "$machine" = 1 ]; then machine_certs; fi
+}
+
 # --- main ---------------------------------------------------------------------
 
 TARGET_FLAG=""
@@ -284,6 +473,7 @@ case "$cmd" in
     install) require_running; cmd_install "$@" ;;
     cp-in) require_running; cmd_cp_in "$@" ;;
     cp-out) require_running; cmd_cp_out "$@" ;;
+    certs) cmd_certs "$@" ;;
     screenshot) require_running; cmd_screenshot "$@" ;;
     zoom) require_running; cmd_zoom "$@" ;;
     click|double_click|triple_click|right_click|middle_click|move|mouse_down|mouse_up|drag|scroll|type|key|launch|focus|wait_window|wait|windows|active|size|cursor)

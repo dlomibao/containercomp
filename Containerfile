@@ -39,6 +39,20 @@ RUN if [ "$(dpkg --print-architecture)" = "amd64" ] && [ "$WITH_WINE" = "1" ]; t
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
+# Extra CA certificates for TLS-inspecting corporate proxies, passed in by
+# `ccu build` from `ccu certs`, so the pip step below works behind one. Point
+# Python and Node at the system bundle so they see these CAs too.
+ARG CCU_EXTRA_CA=""
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+RUN if [ -n "$CCU_EXTRA_CA" ]; then \
+        mkdir -p /usr/local/share/ca-certificates/ccu \
+        && printf '%s\n' "$CCU_EXTRA_CA" | awk '/BEGIN CERT/ {n++; f = sprintf("/usr/local/share/ca-certificates/ccu/build-%02d.crt", n)} f {print > f} /END CERT/ {close(f); f = ""}' \
+        && update-ca-certificates; \
+    fi
+
 # Python env for the MCP server.
 RUN python3 -m venv --system-site-packages /opt/ccu/venv \
     && /opt/ccu/venv/bin/pip install --no-cache-dir "mcp>=1.2,<2"
