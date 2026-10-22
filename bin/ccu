@@ -499,7 +499,7 @@ snap_save() {
     # with exports, and `up` sets it again for the new container's network mode.
     podman commit -q --pause="$pause" \
         -c 'ENV VNC_PASSWORD=""' \
-        -c 'ENV CCU_EGRESS_PROXY="" http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" no_proxy="" NO_PROXY=""' \
+        -c 'ENV CCU_EGRESS_PROXY="" http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" no_proxy="" NO_PROXY="" all_proxy="" ALL_PROXY=""' \
         -c "LABEL containercomp.target=\"$TARGET\"" \
         -c "LABEL containercomp.snapshot=\"$name\"" \
         -c "LABEL containercomp.snapshot.base=\"$IMAGE\"" \
