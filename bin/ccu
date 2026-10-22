@@ -501,6 +501,7 @@ snap_save() {
         -c 'ENV VNC_PASSWORD=""' \
         -c 'ENV CCU_EGRESS_PROXY="" http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" no_proxy="" NO_PROXY="" all_proxy="" ALL_PROXY=""' \
         -c "LABEL containercomp.target=\"$TARGET\"" \
+        -c 'LABEL containercomp.egress=""' \
         -c "LABEL containercomp.snapshot=\"$name\"" \
         -c "LABEL containercomp.snapshot.base=\"$IMAGE\"" \
         -c "LABEL containercomp.snapshot.parent=\"$(snap_from)\"" \
