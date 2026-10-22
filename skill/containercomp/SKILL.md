@@ -27,8 +27,9 @@ Tell the user the viewer URL (`http://localhost:6080/` for native, `:6081` for x
 ```bash
 ccu install gimp inkscape                  # apt packages
 ccu install ~/Downloads/app_arm64.deb      # host file: copied in, then installed
-ccu install ~/Downloads/Tool.AppImage      # becomes a command: `tool`
-ccu install https://example.com/app.tar.gz # downloaded, then extracted to ~/apps/app/
+ccu install ~/Downloads/Tool-1.2-arm64.AppImage   # unpacked; becomes the command `tool`
+ccu install https://example.com/app.tar.gz # downloaded, extracted to ~/apps/app/; prints the executables it found
+ccu install chromium                       # browsers: chromium, firefox, google-chrome (x86 only)
 ccu -t x86 install ~/Downloads/setup.exe   # starts the Windows installer on the desktop
 ```
 
@@ -37,8 +38,8 @@ A `.exe` or `.msi` install opens the installer GUI. Finish it with the screen-co
 On Apple Silicon only **64-bit** Windows programs work. 32-bit ones (`file` reports `PE32 executable`) fail with errors such as `status c0000018` or a qemu crash. If `ccu install` warns that a file is 32-bit, look for the vendor's 64-bit installer or `.msi` instead of retrying. If `ccu -t x86 up` warns that Rosetta is off, tell the user. The fix needs the user's approval because it restarts the Podman VM.
 
 Watch for these:
-- Ubuntu's `firefox` and `chromium` apt packages are snap stubs, and snaps don't work in containers. Install browsers from vendor repos or tarballs instead.
-- Electron and Chromium-based apps usually need `--no-sandbox`.
+- Browsers: use `ccu install chromium` or `ccu install firefox`, not apt names like `chromium-browser`. Ubuntu's own packages are snap stubs, and snaps don't work in containers; `ccu install` sets up a deb source instead. Google Chrome has no Linux arm64 build, so on the native target use `chromium` (built by the xtradeb PPA); `google-chrome` works on the x86 target. Launch with `ccu launch chromium URL` or `ccu launch firefox URL`.
+- Chromium and Chrome run with their sandbox in the container. Add `--no-sandbox` only if an app exits with a sandbox error (some Electron apps add it themselves).
 - To find the binary a package installed, run `ccu exec dpkg -L <pkg> | grep bin/`.
 
 ## Certificate errors and proxies (corporate networks)
@@ -50,7 +51,7 @@ ccu certs sync             # trust the extra roots the Mac trusts (applies to th
 ccu certs add ~/corp.pem   # or a CA file the user names
 ```
 
-For Chrome/Chromium, also run `ccu install libnss3-tools && ccu certs apply`. Proxy variables are only picked up when the container is created, so if `HTTPS_PROXY` changed, a `ccu rm && ccu up` is needed (ask first). `ccu certs sync --machine` changes the shared Podman VM; run it only when the user asks, for `podman pull` failures.
+Chrome, Chromium and Firefox pick these up too, including browsers installed later with `ccu install`. On an image built before certutil was added, Chromium reports `NET::ERR_CERT_AUTHORITY_INVALID`; run `ccu install libnss3-tools && ccu certs apply`. Proxy variables are only picked up when the container is created, so if `HTTPS_PROXY` changed, a `ccu rm && ccu up` is needed (ask first). `ccu certs sync --machine` changes the shared Podman VM; run it only when the user asks, for `podman pull` failures.
 
 ## The control loop
 
