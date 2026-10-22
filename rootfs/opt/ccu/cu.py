@@ -219,6 +219,95 @@ def focus(pattern):
         raise CuError(f"no window matching {pattern!r}")
 
 
+# --- clipboard -----------------------------------------------------------------
+# X selections belong to a process: xclip forks into the background and serves
+# the value until something else takes the selection over. CLIPBOARD is what
+# ctrl+c / ctrl+v use; PRIMARY is the last highlighted text (middle-click paste).
+
+SELECTIONS = ("clipboard", "primary")
+TEXT_TARGETS = ("UTF8_STRING", "text/plain;charset=utf-8", "STRING", "TEXT", "text/plain")
+META_TARGETS = ("TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS", "DELETE", "INCR")
+
+
+def _selection(selection):
+    if selection not in SELECTIONS:
+        raise CuError(f"unknown selection {selection!r}; use clipboard or primary")
+    return selection
+
+
+def _label(selection):
+    return "clipboard" if selection == "clipboard" else "PRIMARY selection"
+
+
+def _audit_data(data):
+    # Clipboard contents are logged like typed text (CCU_AUDIT_TYPE); binary data by size only.
+    if isinstance(data, str):
+        return audit.redact_text(data)
+    return {"redacted": "bytes", "len": len(data)}
+
+
+def clipboard_targets(selection="clipboard"):
+    """Data types the selection's owner offers, e.g. ["UTF8_STRING"] or
+    ["image/png"]; [] when nothing owns it (empty clipboard)."""
+    proc = subprocess.run(["xclip", "-selection", _selection(selection), "-t", "TARGETS", "-o"],
+                          env=_env(), capture_output=True, text=True, timeout=10)
+    if proc.returncode != 0:
+        return []
+    return [t for t in proc.stdout.split() if t not in META_TARGETS]
+
+
+def clipboard_get(selection="clipboard", mime=None, image_ok=False):
+    """Return (data, type): str for text, bytes for other types (mime="image/png").
+    With no mime, text is preferred, then image/png if image_ok."""
+    with audit.event("clipboard_get", {"selection": selection, "type": mime}, kind="observation") as ev:
+        targets = clipboard_targets(selection)
+        if not targets:
+            raise CuError(f"the {_label(selection)} is empty")
+        if mime:
+            if mime not in targets:
+                raise CuError(f"the {_label(selection)} has no {mime}; it holds: {' '.join(targets)}")
+            target = mime
+        else:
+            target = next((t for t in TEXT_TARGETS if t in targets), None)
+            if target is None and image_ok and "image/png" in targets:
+                target = "image/png"
+            if target is None:
+                hint = " (save it with: ccu clip get --type image/png > FILE.png)" if "image/png" in targets else ""
+                raise CuError(f"the {_label(selection)} holds no text, only: {' '.join(targets)}{hint}")
+        proc = subprocess.run(["xclip", "-selection", selection, "-t", target, "-o"],
+                              env=_env(), capture_output=True, timeout=30)
+        if proc.returncode != 0:
+            raise CuError(f"xclip failed ({proc.returncode}): {proc.stderr.decode(errors='replace').strip()}")
+        data = proc.stdout
+        if target in TEXT_TARGETS:
+            data, target = data.decode("utf-8", errors="replace"), "text"
+        ev["result"] = {"type": target, "data": _audit_data(data)}
+        return data, target
+
+
+def clipboard_set(data, selection="clipboard", mime=None):
+    """Own the selection with `data` (str, or bytes with a mime type such as
+    image/png). Stays set after this process exits."""
+    if isinstance(data, str):
+        data, mime = data.encode(), mime or "UTF8_STRING"
+    elif not mime:
+        raise CuError("binary clipboard data needs a type, e.g. image/png")
+    if mime == "image/png" and not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise CuError("data is not a PNG image")
+    args = {"selection": selection, "type": mime,
+            "data": _audit_data(data.decode(errors="replace") if mime == "UTF8_STRING" else data)}
+    with audit.event("clipboard_set", args, kind="action", shot=False):
+        # xclip reads all input, takes the selection, then forks a server; the
+        # parent exits. The server must not hold our stdout/stderr (podman exec
+        # would wait for it) and gets its own session so it outlives us.
+        proc = subprocess.Popen(["xclip", "-selection", _selection(selection), "-t", mime, "-i"],
+                                env=_env(), stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+        proc.communicate(data, timeout=10)
+        if proc.returncode != 0:
+            raise CuError(f"xclip failed ({proc.returncode})")
+
+
 def wait_for_window(pattern, timeout=30.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -243,6 +332,32 @@ def _write_png(data, out):
         with open(out, "wb") as f:
             f.write(data)
         print(out)
+
+
+def _clip_cli(a):
+    sel = "primary" if a.primary else "clipboard"
+    if a.action == "get":
+        data, _ = clipboard_get(sel, a.mime)
+        sys.stdout.buffer.write(data.encode() if isinstance(data, str) else data)
+        sys.stdout.buffer.flush()
+        return
+    if a.action == "targets":
+        for t in clipboard_targets(sel):
+            print(t)
+        return
+    data = a.text
+    if a.text == "-":
+        data = sys.stdin.buffer.read()
+        if not a.mime:
+            try:
+                data = data.decode("utf-8")
+            except UnicodeDecodeError:
+                raise CuError("stdin is not UTF-8 text; for binary data pass --type, e.g. --type image/png")
+    if a.action == "paste" and a.primary:
+        raise CuError("paste uses the clipboard; for PRIMARY, set it and middle-click instead")
+    clipboard_set(data, sel, a.mime)
+    if a.action == "paste":
+        key(a.key)
 
 
 def main(argv=None):
@@ -321,6 +436,19 @@ def main(argv=None):
     s = sub.add_parser("wait", help="sleep for N seconds")
     s.add_argument("seconds", type=float)
 
+    s = sub.add_parser("clip", help="clipboard: get | set TEXT|- | paste TEXT|- | targets")
+    clip = s.add_subparsers(dest="action", required=True)
+    for name, hlp in (("get", "print the clipboard"), ("set", "set the clipboard to TEXT (- reads stdin)"),
+                      ("paste", "set the clipboard, then press ctrl+v"), ("targets", "list the data types it holds")):
+        c = clip.add_parser(name, help=hlp)
+        c.add_argument("--primary", action="store_true", help="use the PRIMARY selection (middle-click paste)")
+        if name != "targets":
+            c.add_argument("--type", dest="mime", help="data type such as image/png (raw bytes on stdin/stdout)")
+        if name in ("set", "paste"):
+            c.add_argument("text", help="the text, or - to read it from stdin")
+        if name == "paste":
+            c.add_argument("--key", default="ctrl+v", help="key combo that pastes (ctrl+shift+v in terminals)")
+
     a = p.parse_args(argv)
     try:
         if a.cmd == "screenshot":
@@ -366,6 +494,8 @@ def main(argv=None):
             print(wid, title, sep="\t")
         elif a.cmd == "wait":
             time.sleep(a.seconds)
+        elif a.cmd == "clip":
+            _clip_cli(a)
     except CuError as e:
         print(f"cu: {e}", file=sys.stderr)
         return 1

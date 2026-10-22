@@ -12,7 +12,8 @@ Settings (environment variables, read by each process):
   CCU_AUDIT_SHOTS       1 (default) or 0: save screenshots alongside entries
   CCU_AUDIT_MAX_SHOTS   keep at most this many screenshots, oldest deleted first
                         (default 500; 0 = no limit)
-  CCU_AUDIT_TYPE        how `type` text is logged: length (default), hash, full
+  CCU_AUDIT_TYPE        how `type` text and clipboard contents are logged:
+                        length (default), hash, full
   CCU_AUDIT_SHOT_DELAY  seconds between an action and its screenshot (default 0.5)
   CCU_AUDIT_SOURCE      tag for entries: ccu sets cli, the MCP server sets mcp
   CCU_AUDIT_ECHO        1: also write each entry to stderr after "ccu-audit<TAB>",
