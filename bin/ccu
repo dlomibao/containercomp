@@ -29,6 +29,8 @@ usage: ccu [-t native|x86] <command> [args]
 Lifecycle
   build                 build (or rebuild) the image
   up                    start the desktop (builds the image first if needed)
+  up --egress FILE      ...with network access limited to the domains in FILE
+  up --offline          ...with no network access at all (see "Network" below)
   down                  stop the container (state is kept)
   rm                    delete the container (state is lost; the image stays)
   status                show container status and the viewer URL
@@ -62,8 +64,17 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
+Network (egress allowlist; chosen when the container is created)
+  egress [status]       show the mode and the allowlist
+  egress log [-f] [--all] [-n N]   blocked requests (--all: allowed ones too)
+  egress set FILE|offline          replace the allowlist of a filtered desktop
+  FILE has one domain per line: "example.com" allows just that host,
+  "*.example.com" or ".example.com" allows it and all subdomains; # comments.
+  Only proxy-aware traffic (HTTP_PROXY/HTTPS_PROXY are preset) gets out.
+
 Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_SHOT_DIR,
-VNC_PASSWORD (applied when the container is created).
+VNC_PASSWORD (applied when the container is created), CCU_IMAGE, CCU_EGRESS
+(FILE or "offline", same as up --egress), CCU_EGRESS_IMAGE.
 EOF
 }
 
@@ -131,12 +142,15 @@ EOF
 }
 
 cmd_up() {
+    egress_parse_up "$@"
     ensure_machine
     check_rosetta
+    egress_pre_up
     case "$(state)" in
         running) ;;
         missing)
             podman image exists "$IMAGE" || cmd_build
+            egress_create
             local w=${SCREEN%x*} h=${SCREEN#*x}
             podman run -d --name "$NAME" --hostname "$NAME" \
                 --platform "$PLATFORM" \
@@ -145,6 +159,7 @@ cmd_up() {
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
                 -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
                 --label containercomp.target="$TARGET" \
+                ${EGRESS_ARGS[@]+"${EGRESS_ARGS[@]}"} \
                 "$IMAGE" >/dev/null
             ;;
         *) podman start "$NAME" >/dev/null ;;
@@ -159,6 +174,7 @@ cmd_status() {
     echo "target:    $TARGET ($PLATFORM)"
     echo "container: $NAME ($s)"
     echo "image:     $IMAGE ($(podman image exists "$IMAGE" && echo present || echo 'not built'))"
+    echo "egress:    $(egress_summary)"
     if [ "$s" = running ]; then
         echo "viewer:    http://localhost:$PORT/"
         echo "screen:    $(pexec cu size | tr ' ' x)"
@@ -228,6 +244,209 @@ cmd_cp_out() {
     podman cp "$NAME:$src" "${2:-.}"
 }
 
+# --- egress filtering ---------------------------------------------------------
+# `up --egress FILE` / `up --offline` put the desktop on an --internal podman
+# network (no DNS, no route out) together with a small squid container that is
+# also on the default network and forwards only to allowlisted domains. Both
+# sit outside the desktop, so root inside it can't loosen them. Offline is the
+# same setup with an empty allowlist.
+
+EGRESS_ARGS=()
+EGRESS_REQ=${CCU_EGRESS:-}   # FILE, "offline", or empty (keep / unrestricted)
+EGRESS_LIST=""               # normalized allowlist for this run (temp file)
+EGRESS_HOST=ccu-egress       # the proxy's name inside the desktop (/etc/hosts)
+
+egress_names() {
+    PROXY=$NAME-egress
+    EGRESS_NET=$NAME-internal
+    EGRESS_IMAGE=${CCU_EGRESS_IMAGE:-localhost/containercomp-egress:latest}
+}
+
+egress_state() { podman container inspect -f '{{.State.Status}}' "$PROXY" 2>/dev/null || echo missing; }
+
+# "on" if the desktop was created with egress filtering, empty otherwise.
+egress_label() {
+    podman container inspect -f '{{index .Config.Labels "containercomp.egress"}}' "$NAME" 2>/dev/null || true
+}
+
+egress_build() {
+    echo "building $EGRESS_IMAGE (egress proxy)" >&2
+    podman build -t "$EGRESS_IMAGE" -f "$REPO/egress/Containerfile" "$REPO/egress"
+}
+
+# Print FILE as squid dstdomain lines: lowercase, "*.x" -> ".x", sorted, and
+# without entries that a wildcard already covers. Dies on malformed lines.
+egress_normalize() {
+    [ -f "$1" ] || die "allowlist file '$1' not found"
+    local entries bad
+    entries=$(sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" | tr 'A-Z' 'a-z')
+    bad=$(printf '%s\n' "$entries" \
+        | grep -vE '^$|^(\*?\.)?[a-z0-9_]([a-z0-9_-]*[a-z0-9])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9])?)*$' || true)
+    [ -z "$bad" ] || die "bad allowlist entries in $1: $(printf '%s' "$bad" | tr '\n' ' ')
+(one host name per line: example.com, *.example.com or .example.com; no URLs or ports)"
+    printf '%s\n' "$entries" | sed 's/^\*\././' | sort -u | awk '
+        NF { e[++n] = $0 }
+        END {
+            for (i = 1; i <= n; i++) {
+                x = e[i]; covered = 0
+                for (j = 1; j <= n; j++) {
+                    w = e[j]
+                    if (i == j || substr(w, 1, 1) != ".") continue
+                    if (x == substr(w, 2) || (length(x) > length(w) && substr(x, length(x) - length(w) + 1) == w)) covered = 1
+                }
+                if (!covered) print x
+            }
+        }'
+}
+
+# Turn a request (FILE or "offline") into $EGRESS_LIST.
+egress_load() {
+    EGRESS_LIST=$(mktemp "${TMPDIR:-/tmp}/ccu-egress.XXXXXX")
+    trap 'rm -f "$EGRESS_LIST"' EXIT
+    if [ "$1" != offline ]; then
+        egress_normalize "$1" > "$EGRESS_LIST"
+    fi
+    chmod 0644 "$EGRESS_LIST"
+}
+
+egress_parse_up() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --egress) [ $# -ge 2 ] || die "usage: ccu up --egress FILE"; EGRESS_REQ=$2; shift 2 ;;
+            --egress=*) EGRESS_REQ=${1#*=}; shift ;;
+            --offline) EGRESS_REQ=offline; shift ;;
+            *) die "unknown option for up: $1 (see: ccu help)" ;;
+        esac
+    done
+    if [ -n "$EGRESS_REQ" ]; then egress_load "$EGRESS_REQ"; fi
+}
+
+# Copy $EGRESS_LIST into the proxy; a running squid re-reads it on SIGHUP.
+egress_apply() {
+    local n
+    podman cp "$EGRESS_LIST" "$PROXY:/etc/squid/allowlist.txt"
+    if [ "$(egress_state)" = running ]; then
+        podman kill -s HUP "$PROXY" >/dev/null
+    fi
+    n=$(grep -c . "$EGRESS_LIST" || true)
+    if [ "$n" = 0 ]; then echo "egress: offline, nothing is allowed" >&2
+    else echo "egress: $n allowlisted domain(s)" >&2; fi
+}
+
+# Before `up` touches an existing desktop: a desktop's network mode is fixed at
+# creation, so refuse to change it; otherwise update the list and start the proxy.
+egress_pre_up() {
+    [ "$(state)" != missing ] || return 0
+    if [ -z "$(egress_label)" ]; then
+        [ -z "$EGRESS_REQ" ] || die "'$NAME' was created without egress filtering; recreate it (this discards its state) with: ccu${TARGET_FLAG} rm && ccu${TARGET_FLAG} up --egress FILE"
+        return 0
+    fi
+    [ "$(egress_state)" != missing ] || die "egress proxy '$PROXY' is missing; recreate the desktop with: ccu${TARGET_FLAG} rm && ccu${TARGET_FLAG} up --egress FILE"
+    if [ -n "$EGRESS_REQ" ]; then egress_apply; fi
+    [ "$(egress_state)" = running ] || podman start "$PROXY" >/dev/null
+}
+
+# For a new desktop: create the internal network and the proxy, and set
+# EGRESS_ARGS for `podman run`. No-op unless egress filtering was requested.
+egress_create() {
+    [ -n "$EGRESS_REQ" ] || return 0
+    podman image exists "$EGRESS_IMAGE" || egress_build
+    # Leftovers from a desktop that was removed outside ccu.
+    podman rm -f "$PROXY" >/dev/null 2>&1 || true
+    if podman network exists "$EGRESS_NET"; then podman network rm "$EGRESS_NET" >/dev/null; fi
+    podman network create --internal --disable-dns --label containercomp.egress-for="$NAME" "$EGRESS_NET" >/dev/null
+    local subnet base proxy noproxy=localhost,127.0.0.1,::1
+    subnet=$(podman network inspect -f '{{range .Subnets}}{{.Subnet}}{{end}}' "$EGRESS_NET")
+    case "$subnet" in
+        *.0/24) base=${subnet%.0/24} ;;
+        *) die "unexpected subnet '$subnet' on $EGRESS_NET (expected a /24)" ;;
+    esac
+    # Fixed addresses: the network has no DNS, so the desktop reaches the proxy
+    # through an /etc/hosts entry.
+    podman create --name "$PROXY" --hostname "$PROXY" \
+        --network podman --network "$EGRESS_NET:ip=$base.2" \
+        --label containercomp.egress-for="$NAME" \
+        "$EGRESS_IMAGE" >/dev/null
+    egress_apply
+    podman start "$PROXY" >/dev/null
+    proxy=http://$EGRESS_HOST:3128
+    EGRESS_ARGS=(--network "$EGRESS_NET" --ip "$base.3" --dns 127.0.0.1
+        --add-host "$EGRESS_HOST:$base.2"
+        --cap-drop NET_ADMIN --cap-drop NET_RAW
+        -e CCU_EGRESS_PROXY="$proxy"
+        -e http_proxy="$proxy" -e https_proxy="$proxy" -e HTTP_PROXY="$proxy" -e HTTPS_PROXY="$proxy"
+        -e no_proxy="$noproxy" -e NO_PROXY="$noproxy"
+        --label containercomp.egress=on)
+}
+
+egress_stop() {
+    if [ "$(egress_state)" = running ]; then podman stop -t 2 "$PROXY" >/dev/null && echo "stopped $PROXY"; fi
+}
+
+egress_rm() {
+    if podman container exists "$PROXY"; then podman rm -f "$PROXY" >/dev/null && echo "removed $PROXY"; fi
+    if podman network exists "$EGRESS_NET"; then podman network rm "$EGRESS_NET" >/dev/null && echo "removed network $EGRESS_NET"; fi
+}
+
+# Print a file from the proxy container (running or stopped).
+egress_cat() {
+    local tmp rc=0
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccu-egress.XXXXXX")
+    podman cp "$PROXY:$1" "$tmp/f" >/dev/null 2>&1 && cat "$tmp/f" || rc=1
+    rm -rf "$tmp"
+    return $rc
+}
+
+egress_summary() {
+    local n
+    if [ "$(state)" = missing ]; then echo "-"; return; fi
+    if [ -z "$(egress_label)" ]; then echo "unrestricted"; return; fi
+    n=$(egress_cat /etc/squid/allowlist.txt | grep -c . || true)
+    if [ "$n" = 0 ]; then printf 'offline (nothing allowed)'
+    else printf 'allowlist (%s domain(s))' "$n"; fi
+    echo "; proxy $PROXY ($(egress_state)); blocked requests: ccu${TARGET_FLAG} egress log"
+}
+
+egress_log() {
+    local follow=0 n=50 pat=_DENIED/
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -f|--follow) follow=1; shift ;;
+            --all) pat=.; shift ;;
+            -n) [ $# -ge 2 ] || die "usage: ccu egress log -n N"; n=$2; shift 2 ;;
+            *) die "usage: ccu egress log [-f] [--all] [-n N]" ;;
+        esac
+    done
+    [ "$(egress_state)" != missing ] || die "'$NAME' has no egress proxy (it was not started with --egress or --offline)"
+    if [ "$follow" = 1 ]; then
+        [ "$(egress_state)" = running ] || die "egress proxy '$PROXY' is not running; start it with: ccu${TARGET_FLAG} up"
+        podman exec "$PROXY" tail -n "$n" -F /var/log/squid/access.log | grep --line-buffered -e "$pat"
+    else
+        egress_cat /var/log/squid/access.log | grep -e "$pat" | tail -n "$n" || true
+    fi
+}
+
+cmd_egress() {
+    local sub=${1:-status}
+    [ $# -eq 0 ] || shift
+    case "$sub" in
+        status)
+            echo "egress:    $(egress_summary)"
+            if [ -n "$(egress_label)" ]; then egress_cat /etc/squid/allowlist.txt | sed 's/^/  /'; fi
+            ;;
+        log) egress_log "$@" ;;
+        set)
+            [ $# -eq 1 ] || die "usage: ccu egress set FILE|offline"
+            [ "$(state)" != missing ] || die "container '$NAME' does not exist; create it with: ccu${TARGET_FLAG} up --egress FILE"
+            [ -n "$(egress_label)" ] || die "'$NAME' was created without egress filtering; recreate it with: ccu${TARGET_FLAG} rm && ccu${TARGET_FLAG} up --egress FILE"
+            egress_load "$1"
+            egress_apply
+            ;;
+        build) egress_build ;;
+        *) die "usage: ccu egress [status | log [-f] [--all] [-n N] | set FILE|offline | build]" ;;
+    esac
+}
+
 # --- main ---------------------------------------------------------------------
 
 TARGET_FLAG=""
@@ -240,6 +459,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 set_target
+egress_names
 [ $# -gt 0 ] || { usage; exit 1; }
 cmd=$1; shift
 
@@ -256,9 +476,9 @@ fi
 case "$cmd" in
     help) usage ;;
     build) cmd_build ;;
-    up|start) cmd_up ;;
-    down|stop) podman stop -t 5 "$NAME" >/dev/null && echo "stopped $NAME" ;;
-    rm|reset) podman rm -f "$NAME" >/dev/null && echo "removed $NAME" ;;
+    up|start) cmd_up "$@" ;;
+    down|stop) podman stop -t 5 "$NAME" >/dev/null && echo "stopped $NAME"; egress_stop ;;
+    rm|reset) podman rm -f "$NAME" >/dev/null && echo "removed $NAME"; egress_rm ;;
     status) cmd_status ;;
     open) require_running; open "http://localhost:$PORT/" ;;
     logs)
@@ -281,6 +501,7 @@ case "$cmd" in
         require_running
         exec podman exec -i -u user -w /home/user -e DISPLAY=:1 "$NAME" /opt/ccu/venv/bin/python /opt/ccu/mcp_server.py
         ;;
+    egress) cmd_egress "$@" ;;
     install) require_running; cmd_install "$@" ;;
     cp-in) require_running; cmd_cp_in "$@" ;;
     cp-out) require_running; cmd_cp_out "$@" ;;

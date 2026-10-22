@@ -85,6 +85,15 @@ Key names use xdotool syntax: `Return`, `Escape`, `Tab`, `BackSpace`, `Delete`, 
 - Don't type the user's real passwords, tokens or payment details into apps in the container unless the user asks you to in this conversation.
 - Get confirmation before purchases, sending messages, or other irreversible actions that a GUI app might take on the user's behalf.
 
+## Restricted network (egress allowlist)
+
+The user can start the desktop with limited network access: `ccu up --egress allowlist.txt` (only the listed domains) or `ccu up --offline` (none). `ccu status` shows which mode is active on its `egress:` line. In these modes:
+
+- Traffic leaves only through an HTTP(S) proxy that is already set in `HTTP_PROXY`/`HTTPS_PROXY` (including under `sudo` and for apt). Hosts that aren't allowlisted fail with `403` / `CONNECT tunnel failed`. Anything that bypasses the proxy fails with `Could not resolve host` or `Network is unreachable`.
+- **Blocked requests are by design.** Don't work around them: no `--noproxy`, unsetting proxy variables, raw IPs, other DNS servers, tunnels, mirrors on allowed hosts, or changing network settings as root. The block is enforced outside the container, so those attempts only waste time, and trying them goes against what the user asked for.
+- When something fails, run `ccu egress log` to see exactly which hosts were blocked. Then tell the user which domains the task needs and why, and ask them to extend the allowlist. They can run `ccu egress set <file>` without recreating the desktop. Continue once they have done so.
+- Apt on the native (arm64) target needs `ports.ubuntu.com`. The x86 target needs `archive.ubuntu.com` and `security.ubuntu.com`.
+
 ## MCP alternative
 
 The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.

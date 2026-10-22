@@ -6,6 +6,8 @@ mkdir -p /var/log/ccu
 chown user:user /var/log/ccu
 # Stale from a previous run; start-desktop rewrites it and ccu waits for it.
 rm -f /home/user/.cache/ccu/session.env
+# Point sudo and apt at the egress proxy when ccu runs in --egress mode.
+/opt/ccu/bin/egress-env
 
 if [ -n "${VNC_PASSWORD:-}" ]; then
     x11vnc -storepasswd "$VNC_PASSWORD" /etc/ccu-vncpass >/dev/null

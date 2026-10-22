@@ -1,0 +1,18 @@
+#!/bin/bash
+# Egress-filtered mode (ccu up --egress/--offline sets CCU_EGRESS_PROXY): make
+# sudo and apt use the proxy too, since sudo resets the environment and apt has
+# its own config. Convenience only: the network outside this container is what
+# blocks everything else.
+set -eu
+
+apt_conf=/etc/apt/apt.conf.d/90ccu-egress
+sudoers=/etc/sudoers.d/91-ccu-egress
+
+if [ -z "${CCU_EGRESS_PROXY:-}" ]; then
+    rm -f "$apt_conf" "$sudoers"
+    exit 0
+fi
+
+printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$CCU_EGRESS_PROXY" "$CCU_EGRESS_PROXY" > "$apt_conf"
+echo 'Defaults env_keep += "http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY"' > "$sudoers"
+chmod 0440 "$sudoers"
