@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 
 import ccu_audit as audit
 
@@ -629,7 +630,10 @@ def _do_action(node, el):
     Atspi = _atspi()
     try:
         n = Atspi.Action.get_n_actions(node) if "Action" in node.get_interfaces() else 0
-        names = [(Atspi.Action.get_name(node, i) or "").lower() for i in range(n)]
+        # Its replacement, atspi_action_get_name, is not in the typelib.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            names = [(Atspi.Action.get_action_name(node, i) or "").lower() for i in range(n)]
     except Exception as e:  # noqa: BLE001
         raise CuError(f"element went away before its action could run ({e}): "
                       f"{format_element(el, with_app=True)}")
