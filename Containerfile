@@ -57,6 +57,16 @@ RUN if [ -n "$CCU_EXTRA_CA" ]; then \
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
+# Accessibility tree (`ccu tree`, `ccu click_element`): the AT-SPI client
+# library for Python (cu.py and the MCP server use gi.repository.Atspi).
+# GTK apps register with the AT-SPI bus on their own; Qt and Chromium only do
+# when told to, so turn that on for everything started in the container.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-gi gir1.2-atspi-2.0 \
+    && rm -rf /var/lib/apt/lists/*
+ENV QT_ACCESSIBILITY=1 \
+    QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 \
+    ACCESSIBILITY_ENABLED=1
+
 # Python env for the MCP server.
 RUN python3 -m venv --system-site-packages /opt/ccu/venv \
     && /opt/ccu/venv/bin/pip install --no-cache-dir "mcp>=1.2,<2"
