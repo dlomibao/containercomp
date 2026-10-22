@@ -432,10 +432,13 @@ def verify(path=LOG):
     return n, problems, _sha(prev) if prev is not None else None
 
 
-def render_html(out=None):
-    """Write a static timeline (index.html next to shots/) and return its path."""
+def render_html(out=None, entries=None):
+    """Write a static timeline (index.html next to shots/) and return its path.
+    `entries` renders just those (a test run's segment, with its shots/ copied
+    next to `out`); the chain status is always that of the whole log."""
     out = out or os.path.join(AUDIT_DIR, "index.html")
-    entries = read_entries()
+    base = os.path.dirname(os.path.abspath(out))
+    entries = read_entries() if entries is None else entries
     try:
         n, problems, head = verify()
         chain = "intact" if not problems else f"{len(problems)} problem(s): " + "; ".join(problems[:5])
@@ -445,7 +448,7 @@ def render_html(out=None):
     rows = []
     for e in entries:
         shot = e.get("shot")
-        if shot and os.path.exists(os.path.join(AUDIT_DIR, shot)):
+        if shot and os.path.exists(os.path.join(base, shot)):
             img = f'<a href="{esc(shot)}"><img loading="lazy" src="{esc(shot)}" alt=""></a>'
         else:
             img = '<span class="dim">rotated</span>' if shot else ""

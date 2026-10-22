@@ -1,0 +1,31 @@
+# Mousepad: type a note, save it, then check the file, the window title and
+# the text on screen. Every run starts from the clean base image.
+#
+#   ccu test run examples/mousepad.yaml              # one run
+#   ccu test run examples/mousepad.yaml --repeat 2   # the second run proves the reset
+name: Mousepad saves a note
+description: Types a line into a new Mousepad document, saves it as ~/note.txt,
+  and checks the file contents, the window title and the text on screen.
+from: base
+
+setup:
+  # Fails on a desktop that still has the previous run's file, so it shows
+  # that each run really starts from a clean state.
+  - check: {file: {path: ~/note.txt, exists: false}, timeout: 0}
+  - launch: mousepad
+  - wait_window: Mousepad
+
+steps:
+  - type: "Hello from ccu test\n"
+  - key: ctrl+s
+  - wait_window: Save As
+  - type: /home/user/note.txt          # the file name field has focus
+    name: file name
+  - key: Return
+  - wait_window: note.txt
+
+checks:
+  - window: {title: note.txt - Mousepad, active: true}
+  - file: {path: ~/note.txt, contains: Hello from ccu test}
+  - shell: {run: "wc -l < ~/note.txt", matches: "^1$"}
+  - text: {text: Hello from ccu test, region: [0, 0, 1280, 400]}

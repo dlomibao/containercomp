@@ -59,6 +59,8 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             focus TITLE   wait_window TITLE [--timeout S]   wait S
             (append --shot to any screen command to screenshot afterwards)
 Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
+Tests       test run SPEC... [--from SNAP|--base|--no-reset] [--repeat N] [--keep-going] [--record] [--out DIR]
+            test validate SPEC...   test draft [--since SEQ | --last N]
 Network     up --egress FILE | up --offline   egress [status] | egress log [-f] [--all] | egress set FILE|offline
 ```
 
@@ -109,7 +111,7 @@ Every action is logged, whether it comes from the CLI or the MCP server: clicks,
  "window":"Untitled 1 - Mousepad","shot":"shots/00000008-type.png","ms":237,"prev":"a5a88ec2…"}
 ```
 
-- `source` is `cli` (through `ccu`), `mcp`, or `container` (`cu` run directly inside the container). `kind` is `action`, `observation` or `command`. `ts` is when the action started, `ms` how long it took, and `window` the active window title at that moment.
+- `source` is `cli` (through `ccu`), `mcp`, `test` (a `ccu test` run), or `container` (`cu` run directly inside the container). `kind` is `action`, `observation` or `command`. `ts` is when the action started, `ms` how long it took, and `window` the active window title at that moment.
 - `shot` is a screenshot taken about 0.5 s after each state-changing action (2 s after `launch`), in the background so the action isn't slowed down. For screenshots and zooms it is a copy of the image the agent saw. Only the newest 500 screenshots are kept (`CCU_AUDIT_MAX_SHOTS`); older ones are deleted, and their entries stay in the log. In testing, screenshots were 20 to 100 KB; busier screens are larger.
 - **Typed text is redacted by default**: `type` entries record only the length. `CCU_AUDIT_TYPE=hash` adds a sha256 of the text, so you can check whether a known value was typed, but short secrets can be brute-forced from it. `CCU_AUDIT_TYPE=full` logs the text itself. Screenshots still show whatever text appears on screen, so turn them off (`CCU_AUDIT_SHOTS=0`) for sessions that handle secrets. `exec`, `shell` and `launch` commands are logged in full, with the last 1000 characters of `exec` and `shell` output.
 
@@ -172,6 +174,71 @@ Things to know:
 - On every boot, `/opt/ccu/bin/clean-runtime` deletes the stale X lock, sockets, D-Bus and session files that a snapshot of a live desktop carries, so a restored container boots like a fresh one. Pausing makes the snapshot a single point in time, but an app that was in the middle of saving can still leave a half-written file. Close or save apps before you snapshot when that matters.
 - Snapshots share the base image's layers, so each one only costs the space of its changes. A snapshot depends on its base image, though: rebuilding the base doesn't update existing snapshots.
 - `VNC_PASSWORD` is cleared from a snapshot's environment. Everything else in the container, including files under `~`, ends up in exported archives, so don't export snapshots that contain secrets.
+
+## Test runs
+
+`ccu test` runs an app test written once as a spec, from a known state, as often as you like. Each run resets the desktop from a snapshot, runs the spec's steps, evaluates its checks, and keeps the evidence.
+
+```bash
+ccu test run examples/mousepad.yaml                  # one run; exit 1 if it fails
+ccu test run app.yaml --from golden --repeat 5       # 5 runs, each from a fresh copy of "golden"
+ccu test run a.yaml b.yaml --keep-going --record     # don't stop at the first failure; record video
+ccu test run app.yaml --no-reset                     # against the current desktop, while writing a spec
+ccu test validate app.yaml                           # check a spec without running it
+ccu test draft > app.yaml                            # turn this session's actions into a spec draft
+```
+
+A spec is YAML (or JSON). Every item is one action with its arguments:
+
+```yaml
+name: Mousepad saves a note
+from: base                # snapshot to reset to before each run; "base" = the clean image
+setup:                    # a failure here is an error (the environment), not a test failure
+  - check: {file: {path: ~/note.txt, exists: false}}
+  - launch: mousepad
+  - wait_window: Mousepad
+steps:
+  - type: "Hello from ccu test\n"
+  - key: ctrl+s
+  - wait_window: Save As
+  - type: /home/user/note.txt
+  - key: Return
+checks:                   # all are evaluated; each is retried for up to check_timeout (5 s)
+  - window: {title: note.txt - Mousepad, active: true}
+  - file: {path: ~/note.txt, contains: Hello from ccu test}
+  - shell: {run: "wc -l < ~/note.txt", matches: "^1$"}
+  - text: {text: Hello from ccu test, region: [0, 0, 1280, 400]}
+```
+
+| Steps | Arguments (a list fills them in order; a single value is the first) |
+|---|---|
+| `launch` | `command`, `wait_window`, `timeout` (30) |
+| `wait_window` / `focus` | `title` (substring, case-insensitive), `timeout` (30) |
+| `click`, `double_click`, `triple_click`, `right_click`, `middle_click` | `x`, `y`, `button`, `count`, `mods` (e.g. `ctrl`) |
+| `move` / `drag` / `scroll` | `[x, y]` / `[x0, y0, x1, y1]` / `[x, y, direction, amount]` |
+| `type` / `key` / `wait` | text (`\n` presses Return) / combo or list of combos / seconds |
+| `shell` | `run`, `timeout` (60), `root`; fails on a non-zero exit |
+| `screenshot` | optional label (every item gets a screenshot anyway) |
+| `click_element` / `wait_element` | `name`, `role`, `app`, `timeout` (10); accessibility tree |
+| `check` | any check, inline: `- check: {file: ~/out.txt}` |
+
+| Checks | Passes when |
+|---|---|
+| `window` | `title` (substring) or `matches` (regex) is open; `active: true` = it's focused; `exists: false` = it isn't open |
+| `file` | `path` exists, and `contains` / `matches` (regex) / `equals` its text; `exists: false` = it doesn't exist |
+| `shell` | `run` exits with `exit` (0), and its stdout `contains` / `matches` |
+| `text` | OCR finds `text` (or regex `matches`) on screen, or in `region: [x0, y0, x1, y1]`; `absent: true` inverts |
+| `element` | an accessibility element with `name` (and `role`, `app`, `states`) exists; `exists: false` inverts |
+
+Any item also takes `name:` (a label for the report), `optional: true` (a failure is reported but doesn't fail the run) and `shot: false`. Top-level settings: `timeout` (whole run, 600 s), `settle` (pause before each step's screenshot, 0.5 s), `check_timeout` (5 s).
+
+- **Reset.** Before each run, `ccu test` does `ccu reset` to the spec's `from:` snapshot, or `--from SNAP` / `--base` if given, or (with neither) to the snapshot the container came from. `--no-reset` skips it. Opening apps is part of `setup`, since snapshots don't keep running processes.
+- **Failures.** A failing step skips the rest of the run, and the checks are not evaluated. All checks are evaluated even after one fails. Without `--keep-going`, `ccu test run` stops after the first failed run.
+- **"Text on screen" uses OCR** (tesseract, at 2x scale, case and whitespace ignored), so it works for any app, including Wine and canvas-drawn UIs. Prefer short, distinctive phrases and a `region`. `element` checks and `click_element` use the accessibility tree instead, which is exact but only works for apps that expose one (most GTK apps do; Wine apps generally don't).
+- **Results** go to `$CCU_SHOT_DIR/test-<time>/` (or `--out DIR`): `summary.json`, `junit.xml` (for CI) and `index.html` for all runs, and per run `result.json`, `report.html` (each step with its status, message and screenshot), `shots/`, `audit/` (the run's audit log entries with their screenshots and the HTML timeline, plus `verify.txt`), the spec, `reset.log`, and `recording.mp4` with `--record`. Actions are logged with source `test`.
+- **Drafts.** `ccu test draft` writes a spec from the audit log of the current container: the launches, clicks, keys and `ccu exec` commands, plus a `wait_window` wherever the active window changed. Typed text is logged only as its length (unless `CCU_AUDIT_TYPE=full`), so it appears as `TODO`. `--since SEQ` or `--last N` limits the range. Fill in the text, add checks, and run it.
+- Specs and results hold the typed text and the expected values in plain text. Don't put secrets in them.
+- The runner (`/opt/ccu/ccu_test.py`) and the reports run inside the container, so the host needs no Python. `ccu test` copies the runner from this checkout into the container on every run, so containers from older images work too. Older images lack PyYAML and tesseract, though (`ccu build`, or write JSON and skip `text` checks).
 
 ## Restricting network access
 
@@ -270,6 +337,9 @@ bin/ccu                       host CLI
 rootfs/opt/ccu/cu.py          in-container control library + CLI (`cu`)
 rootfs/opt/ccu/mcp_server.py  MCP server (FastMCP, stdio)
 rootfs/opt/ccu/ccu_audit.py   audit log, `cu exec`, screen recording
+rootfs/opt/ccu/ccu_test.py    test runner and reports for `ccu test`
+examples/                     example test specs
+tests/                        unit tests (python3 -m unittest discover -s tests)
 rootfs/usr/local/bin/ccu-install   app installer (apt/deb/AppImage/Wine/archives)
 rootfs/etc/supervisor/conf.d/ccu.conf  Xvfb, XFCE, x11vnc, noVNC
 egress/                       egress proxy image (squid + config) for `ccu up --egress`

@@ -104,6 +104,15 @@ Audit and recording (every action is logged; see README "Audit and recording")
   record stop           finish the recording, copy it to the host, print its path
   record status
 
+Tests (repeatable runs from a snapshot; spec format: README "Test runs")
+  test run SPEC... [--from SNAP | --base | --no-reset] [--repeat N] [--keep-going]
+                   [--record] [--out DIR]
+                        reset the desktop, run the spec's setup/steps/checks, and
+                        write results (summary.json, junit.xml, index.html, and
+                        per run: screenshots, audit log, report); exit 1 on failure
+  test validate SPEC... check specs without running them
+  test draft [--since SEQ | --last N]   turn this session's audit log into a spec draft
+
 Network (egress allowlist; chosen when the container is created)
   egress [status]       show the mode and the allowlist
   egress log [-f] [--all] [-n N]   blocked requests (--all: allowed ones too)
@@ -1007,6 +1016,202 @@ cmd_certs() {
     if [ "$machine" = 1 ]; then machine_certs; fi
 }
 
+# --- test runs ----------------------------------------------------------------
+# `ccu test run` resets the container before each run, then the runner
+# (rootfs/opt/ccu/ccu_test.py) parses the spec and drives the desktop inside it.
+# Each run directory (result.json, report.html, shots/, audit/) is copied back
+# into one results directory, which gets summary.json, junit.xml and index.html.
+
+TEST_PY=/opt/ccu/ccu_test.py
+TEST_TMP=/tmp/ccu-test
+
+# Containers from older images (and edits since the build) get this checkout's runner.
+test_push() { podman cp "$REPO/rootfs/opt/ccu/ccu_test.py" "$NAME:$TEST_PY"; }
+
+# The snapshot a spec starts from: a top-level `from: NAME` line (YAML) or
+# "from": "NAME" (JSON). The runner re-reads it with a real parser and fails the
+# run if the two disagree.
+test_spec_from() {
+    sed -n -E -e "s/^from:[[:space:]]*[\"']?([A-Za-z0-9_.-]*)[\"']?[[:space:]]*(#.*)?\$/\\1/p" \
+        -e 's/.*"from"[[:space:]]*:[[:space:]]*"([A-Za-z0-9_.-]*)".*/\1/p' "$1" | head -n 1
+}
+
+json_str() { printf '"%s"' "$(printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t\r' '   ')"; }
+
+# result.json for a run that never reached the runner: DIR SPEC RUN RESET MESSAGE
+test_error_result() {
+    local stem
+    stem=$(basename "$2"); stem=${stem%.*}
+    printf '{\n  "name": %s,\n  "spec": %s,\n  "run": %s,\n  "reset": %s,\n  "status": "error",\n  "error": %s,\n  "started": "%s",\n  "seconds": 0,\n  "items": []\n}\n' \
+        "$(json_str "$stem")" "$(json_str "$(basename "$2")")" "$3" "$(json_str "$4")" "$(json_str "$5")" \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$1/result.json"
+    echo "  ERROR: $5" >&2
+}
+
+test_status() { sed -n 's/^  "status": "\([a-z]*\)",$/\1/p' "$1/result.json" 2>/dev/null | head -n 1; }
+
+# One run: SPEC DIR RUN. Uses TEST_RESET (spec|snap|base|none), TEST_FROM, TEST_RECORD.
+test_one() {
+    local spec=$1 dir=$2 run=$3 host_from args=() desc="" t0 t1 cdir base rc=0 status f
+    mkdir -p "$dir"
+    host_from=$(test_spec_from "$spec")
+    case "$TEST_RESET" in
+        snap) args=(--from "$TEST_FROM") ;;
+        base) args=(--base) ;;
+        spec)
+            case "$host_from" in
+                "") ;;  # the snapshot the container came from
+                base) args=(--base) ;;
+                *) args=(--from "$host_from") ;;
+            esac
+            ;;
+    esac
+    t0=$(date +%s)
+    if [ "$TEST_RESET" != none ]; then
+        echo "[$(basename "$dir")] reset ${args[*]+${args[*]}}" >&2
+        # A child ccu, so a failed reset ends this run instead of the whole test.
+        if ! "$REPO/bin/ccu" $TARGET_FLAG reset ${args[@]+"${args[@]}"} > "$dir/reset.log" 2>&1; then
+            test_error_result "$dir" "$spec" "$run" "" "reset failed: $(tail -n 2 "$dir/reset.log" | tr '\n' ' ')(see reset.log)"
+            return 1
+        fi
+        f=$(snap_from)
+        desc=${f:+snapshot $f}; desc=${desc:-base image}
+    elif [ "$(state)" != running ]; then
+        test_error_result "$dir" "$spec" "$run" "" "container '$NAME' is not running; start it with ccu${TARGET_FLAG} up, or drop --no-reset"
+        return 1
+    fi
+    t1=$(date +%s)
+    test_push
+    base=$(basename "$spec")
+    cdir=$TEST_TMP/$(basename "$dir")
+    podman exec "$NAME" sh -c 'rm -rf "$1" && mkdir -p "$1"' sh "$cdir"
+    podman cp "$spec" "$NAME:$cdir/$base"
+    podman exec "$NAME" chown -R user:user "$TEST_TMP"
+    set -- run "$cdir/$base" --out "$cdir" --run "$run" --reset "$desc" --host-from "$host_from"
+    if [ "$TEST_RECORD" = 1 ]; then set -- "$@" --record; fi
+    pexec env CCU_AUDIT_SOURCE=test python3 "$TEST_PY" "$@" || rc=$?
+    podman cp "$NAME:$cdir/." "$dir/" || true
+    podman exec "$NAME" rm -rf "$cdir" || true
+    if [ ! -f "$dir/result.json" ]; then
+        test_error_result "$dir" "$spec" "$run" "$desc" "the runner exited with $rc before writing a result"
+        return 1
+    fi
+    if [ -d "$dir/audit" ]; then audit_verify > "$dir/audit/verify.txt" 2>&1 || true; fi
+    status=$(test_status "$dir")
+    f="reset $(( t1 - t0 ))s"
+    if [ "$TEST_RESET" = none ]; then f="no reset"; fi
+    echo "[$(basename "$dir")] $(echo "${status:-error}" | tr a-z A-Z) in $(( $(date +%s) - t1 ))s ($f): $dir/report.html" >&2
+    [ "$status" = passed ]
+}
+
+# summary.json, junit.xml and index.html for every run directory in $1. The
+# report is built in the container (the host may have no Python).
+test_report() {
+    local dir=$1 tmp d f cdir=$TEST_TMP/report-$$
+    if [ "$(state)" != running ]; then
+        for d in "$dir"/*/; do
+            if [ -f "$d/result.json" ]; then printf '%s\t%s\n' "$(basename "$d")" "$(test_status "$d")"; fi
+        done > "$dir/summary.txt"
+        echo "ccu: '$NAME' is not running, so only $dir/summary.txt was written (no HTML or JUnit report)" >&2
+        return 0
+    fi
+    tmp=$(mktemp -d "${TMPDIR:-/tmp}/ccu-test.XXXXXX")
+    for d in "$dir"/*/; do
+        if [ -f "$d/result.json" ]; then
+            mkdir -p "$tmp/$(basename "$d")"
+            cp "$d/result.json" "$tmp/$(basename "$d")/"
+        fi
+    done
+    test_push
+    podman exec "$NAME" sh -c 'rm -rf "$1" && mkdir -p "$(dirname "$1")"' sh "$cdir"
+    podman cp "$tmp" "$NAME:$cdir"
+    podman exec "$NAME" chown -R user:user "$cdir"
+    podman exec -u user "$NAME" python3 "$TEST_PY" report "$cdir" || true
+    for f in summary.json junit.xml index.html; do podman cp "$NAME:$cdir/$f" "$dir/$f"; done
+    podman exec "$NAME" rm -rf "$cdir" || true
+    rm -rf "$tmp"
+}
+
+test_run() {
+    local specs=() out="" repeat=1 keep=0 s i n id base total=0 failed=0
+    TEST_RESET=spec TEST_FROM="" TEST_RECORD=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --from) [ $# -ge 2 ] || die "usage: ccu test run SPEC... --from SNAPSHOT"; TEST_FROM=$2; TEST_RESET=snap; shift 2 ;;
+            --from=*) TEST_FROM=${1#*=}; TEST_RESET=snap; shift ;;
+            --base) TEST_RESET=base; shift ;;
+            --no-reset) TEST_RESET=none; shift ;;
+            --repeat) [ $# -ge 2 ] || die "--repeat needs a number"; repeat=$2; shift 2 ;;
+            --repeat=*) repeat=${1#*=}; shift ;;
+            -k|--keep-going) keep=1; shift ;;
+            -o|--out) [ $# -ge 2 ] || die "--out needs a directory"; out=$2; shift 2 ;;
+            --record) TEST_RECORD=1; shift ;;
+            -*) die "unknown option '$1' (usage: ccu test run SPEC... [--from SNAP | --base | --no-reset] [--repeat N] [--keep-going] [--record] [--out DIR])" ;;
+            *) [ -f "$1" ] || die "no such spec file: $1"; specs+=("$1"); shift ;;
+        esac
+    done
+    [ "${#specs[@]}" -gt 0 ] || die "usage: ccu test run SPEC... [--from SNAP | --base | --no-reset] [--repeat N] [--keep-going] [--record] [--out DIR]"
+    case "$repeat" in ''|*[!0-9]*|0) die "--repeat needs a number of runs (1 or more)" ;; esac
+    # "base" means the base image here, as it does in a spec's `from:`.
+    if [ "$TEST_RESET" = snap ] && [ "$TEST_FROM" = base ]; then TEST_RESET=base; fi
+    if [ "$TEST_RESET" = snap ]; then snap_check_name "$TEST_FROM"; fi
+    ensure_machine
+    # Catch spec mistakes before resetting anything (needs a running desktop for the parser).
+    if [ "$(state)" = running ]; then
+        test_push
+        for s in "${specs[@]}"; do
+            podman exec -i -u user "$NAME" python3 "$TEST_PY" validate --as "$s" --host-from "$(test_spec_from "$s")" - < "$s" >/dev/null \
+                || die "fix $s first (check it with: ccu${TARGET_FLAG} test validate $s)"
+        done
+    fi
+    out=${out:-$SHOT_DIR/test-$(date +%Y%m%d-%H%M%S)}
+    mkdir -p "$out"
+    out=$(cd "$out" && pwd)
+    for s in "${specs[@]}"; do
+        i=1
+        while [ "$i" -le "$repeat" ]; do
+            base=$(basename "$s"); base=${base%.*}-$i
+            id=$base n=2
+            while [ -e "$out/$id" ]; do id=$base.$n; n=$((n + 1)); done
+            total=$((total + 1))
+            if ! test_one "$s" "$out/$id" "$i"; then
+                failed=$((failed + 1))
+                if [ "$keep" = 0 ]; then break 2; fi
+            fi
+            i=$((i + 1))
+        done
+    done
+    test_report "$out"
+    echo "$((total - failed)) of $total run(s) passed$([ "$keep" = 1 ] || [ "$failed" = 0 ] || echo '; stopped at the first failure (--keep-going runs the rest)')"
+    if [ -f "$out/index.html" ]; then echo "$out/index.html"; else echo "$out/summary.txt"; fi
+    [ "$failed" = 0 ]
+}
+
+cmd_test() {
+    local sub=${1:-} s rc=0 from
+    [ $# -eq 0 ] || shift
+    case "$sub" in
+        run) test_run "$@" ;;
+        validate)
+            [ $# -gt 0 ] || die "usage: ccu test validate SPEC..."
+            require_running
+            test_push
+            for s in "$@"; do
+                [ -f "$s" ] || die "no such spec file: $s"
+                podman exec -i -u user "$NAME" python3 "$TEST_PY" validate --as "$s" --host-from "$(test_spec_from "$s")" - < "$s" || rc=1
+            done
+            return $rc
+            ;;
+        draft)
+            require_running
+            test_push
+            from=$(snap_from)
+            pexec python3 "$TEST_PY" draft --from "${from:-base}" "$@"
+            ;;
+        *) die "usage: ccu test run SPEC... [options] | validate SPEC... | draft [--since SEQ | --last N]" ;;
+    esac
+}
+
 # --- main ---------------------------------------------------------------------
 
 TARGET_FLAG=""
@@ -1072,6 +1277,7 @@ case "$cmd" in
     cp-in) require_running; cmd_cp_in "$@" ;;
     cp-out) require_running; cmd_cp_out "$@" ;;
     certs) cmd_certs "$@" ;;
+    test) cmd_test "$@" ;;
     screenshot) require_running; cmd_screenshot "$@" ;;
     zoom) require_running; cmd_zoom "$@" ;;
     audit) require_running; cmd_audit "$@" ;;
