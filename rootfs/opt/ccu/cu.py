@@ -6,7 +6,8 @@ Used directly as a CLI inside the container (and by the host `ccu` script via
 
 Coordinates are screen pixels with (0, 0) at the top-left. Screenshots are
 taken at the native screen resolution, so pixel positions in a screenshot are
-directly clickable.
+directly clickable. Apps with an accessibility tree can also be driven by
+element name (tree, find, click_element), in the same screen coordinates.
 """
 import argparse
 import contextlib
@@ -319,8 +320,10 @@ def _name_tier(name, want):
     return None
 
 
-def _node_info(Atspi, node, role, text_max=TEXT_MAX):
+def _node_info(Atspi, node, role, origin=None, text_max=TEXT_MAX):
     """Screen extents and text of one node; keys are missing if it has none.
+    With `origin` (x, y), extents are read relative to the window and moved
+    by it (for toolkits that can't report screen positions, see _origin).
 
     Interface methods are called through their class (Atspi.Text.get_text):
     the same names on Atspi.Accessible are deprecated getters."""
@@ -331,8 +334,12 @@ def _node_info(Atspi, node, role, text_max=TEXT_MAX):
         return out
     if "Component" in ifaces:
         with contextlib.suppress(Exception):  # app quit or call unsupported
-            r = Atspi.Component.get_extents(node, Atspi.CoordType.SCREEN)
-            out.update(x=r.x, y=r.y, w=r.width, h=r.height)
+            if origin is None:
+                r = Atspi.Component.get_extents(node, Atspi.CoordType.SCREEN)
+                out.update(x=r.x, y=r.y, w=r.width, h=r.height)
+            else:
+                r = Atspi.Component.get_extents(node, Atspi.CoordType.WINDOW)
+                out.update(x=r.x + origin[0], y=r.y + origin[1], w=r.width, h=r.height)
     if "Text" in ifaces:
         with contextlib.suppress(Exception):  # app quit or call unsupported
             n = Atspi.Text.get_character_count(node)
@@ -345,6 +352,11 @@ def _node_info(Atspi, node, role, text_max=TEXT_MAX):
             elif n > 0:
                 t = Atspi.Text.get_text(node, 0, min(n, text_max))
                 out["text"] = t + ("..." if n > text_max else "")
+        # U+FFFC stands for embedded child objects (web pages): not text.
+        if "￼" in out.get("text", ""):
+            out["text"] = out["text"].replace("￼", "")
+            if not out["text"].strip():
+                del out["text"]
     return out
 
 
@@ -359,6 +371,20 @@ def _label_of(Atspi, node):
     return ""
 
 
+def _origin(pid, title):
+    """Screen position of the X window with this pid and title, or None.
+
+    GTK 4 reports 0,0 for every SCREEN position on X11 (it only knows
+    positions inside its windows), so its elements are placed by their
+    WINDOW position plus their window's origin. Popovers are separate
+    surfaces and may come out misplaced."""
+    for wid, wpid, wtitle in list_windows():
+        if wpid == str(pid) and wtitle == title:
+            vals = dict(line.split("=", 1) for line in xdotool("getwindowgeometry", "--shell", wid).split())
+            return int(vals["X"]), int(vals["Y"])
+    return None
+
+
 def _walk(Atspi, app_filter, role, name, visible_only, limit, all_nodes, max_nodes, max_depth,
           onscreen=True):
     # visible_only: skip nodes (and their subtrees) that aren't showing, and
@@ -368,7 +394,7 @@ def _walk(Atspi, app_filter, role, name, visible_only, limit, all_nodes, max_nod
     desktop = Atspi.get_desktop(0)
     desktop.clear_cache()
 
-    def visit(node, depth, app, pid, window, parent=("", "")):
+    def visit(node, depth, app, pid, window, parent=("", ""), origin=None, gtk4=False):
         if len(results) >= limit or visited[0] >= max_nodes or depth > max_depth:
             return
         visited[0] += 1
@@ -386,9 +412,14 @@ def _walk(Atspi, app_filter, role, name, visible_only, limit, all_nodes, max_nod
             nm = parent[1] if parent[0] == "combo_box" else _label_of(Atspi, node)
         if depth == 1:
             window = nm
+            if gtk4:
+                origin = _origin(pid, nm)
         if (role is None or _role_ok(r, role)) and (name is None or _name_tier(nm, name) is not None):
-            info = _node_info(Atspi, node, r)
+            info = _node_info(Atspi, node, r, origin)
             keep = all_nodes or nm or info.get("text") or r in _UNNAMED_OK
+            # A button's own caption (GTK 4, web pages) would only repeat it.
+            if keep and not all_nodes and r in ("label", "static") and nm and nm == parent[1]:
+                keep = False
             if keep and (not visible_only or not onscreen or (
                     info.get("w", 0) > 0 and info.get("h", 0) > 0
                     and info["x"] < sw and info["y"] < sh
@@ -411,7 +442,7 @@ def _walk(Atspi, app_filter, role, name, visible_only, limit, all_nodes, max_nod
             except Exception:  # noqa: BLE001
                 continue
             if child is not None:
-                visit(child, depth + 1, app, pid, window, (r, nm))
+                visit(child, depth + 1, app, pid, window, (r, nm), origin)
 
     for i in range(desktop.get_child_count()):
         try:
@@ -425,13 +456,16 @@ def _walk(Atspi, app_filter, role, name, visible_only, limit, all_nodes, max_nod
             pid = app.get_process_id()
         except Exception:  # noqa: BLE001
             pid = 0
+        gtk4 = False
+        with contextlib.suppress(Exception):
+            gtk4 = app.get_toolkit_name() == "GTK" and app.get_toolkit_version().startswith("4.")
         for j in range(app.get_child_count()):
             try:
                 top = app.get_child_at_index(j)
             except Exception:  # noqa: BLE001
                 continue
             if top is not None:
-                visit(top, 1, app_name, pid, "")
+                visit(top, 1, app_name, pid, "", gtk4=gtk4)
     return results, visited[0]
 
 
@@ -550,8 +584,45 @@ def click_element(name, role=None, app=None, button="left", count=1, index=None,
         return el
     if el["w"] <= 0 or el["h"] <= 0:
         raise CuError(f"element has no on-screen box: {format_element(el, with_app=True)}")
-    click(el["x"] + el["w"] // 2, el["y"] + el["h"] // 2, button, count)
+    cx, cy = el["x"] + el["w"] // 2, el["y"] + el["h"] // 2
+    move(cx, cy)
+    _uncover(el)
+    click(cx, cy, button, count)
     return el
+
+
+def _pointer_window():
+    """(window id, pid or None, title) of the top-level window under the pointer."""
+    vals = dict(line.split("=", 1) for line in xdotool("getmouselocation", "--shell").split())
+    wid = vals.get("WINDOW", "")
+    try:
+        pid = int(xdotool("getwindowpid", wid).strip())
+    except (CuError, ValueError):
+        pid = None
+    try:
+        title = xdotool("getwindowname", wid).strip()
+    except CuError:
+        title = ""
+    return wid, pid, title
+
+
+def _uncover(el):
+    # The pointer is on the element's centre. If a window of another process
+    # is on top there, raise the element's window (as a user would click it
+    # first) and check again. Windows without _NET_WM_PID are trusted.
+    wid, pid, title = _pointer_window()
+    if pid is None or not el.get("pid") or pid == el["pid"]:
+        return
+    rows = [r for r in list_windows() if r[1] == str(el["pid"])]
+    pick = next((r for r in rows if r[2] == el["window"]), rows[0] if rows else None)
+    if pick:
+        _run("wmctrl", "-i", "-a", pick[0], check=False)
+        time.sleep(0.3)
+        wid, pid, title = _pointer_window()
+        if pid is None or pid == el["pid"]:
+            return
+    raise CuError(f"element is covered by window {title!r} (pid {pid}) and its own window could not "
+                  f"be raised; use focus, or click_element --action: {format_element(el, with_app=True)}")
 
 
 def _do_action(node, el):

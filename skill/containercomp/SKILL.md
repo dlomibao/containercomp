@@ -55,7 +55,7 @@ For Chrome/Chromium, also run `ccu install libnss3-tools && ccu certs apply`. Pr
 ## The control loop
 
 1. **Look.** Run `ccu screenshot`. It prints a PNG path. Read that file with the Read tool to see the screen.
-2. **Act.** Run a single action using pixel coordinates taken from the latest screenshot. The screenshot is at native resolution (1280x800 by default), so image pixels are screen pixels.
+2. **Act.** Run a single action using pixel coordinates taken from the latest screenshot. The screenshot is at native resolution (1280x800 by default), so image pixels are screen pixels. If the app has an accessibility tree, act by element name instead (`ccu click_element NAME`, see the next section).
 3. **Verify.** Take another screenshot. Adding `--shot` to the action does steps 2 and 3 together: `ccu click 640 400 --shot`.
 4. Repeat until done.
 
@@ -77,6 +77,31 @@ ccu wait 2
 ```
 
 Key names use xdotool syntax: `Return`, `Escape`, `Tab`, `BackSpace`, `Delete`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `Page_Up`, `Page_Down`, `F1`..`F12`, `super`, plus combos such as `ctrl+shift+t` and `alt+F4`.
+
+## Act on UI elements by name (preferred when the app has a tree)
+
+GTK and Qt apps (most of the Linux desktop, including the XFCE panel and terminal) publish their widgets through the accessibility tree. When an app does, read the tree instead of guessing pixels: it's exact, and a scoped tree costs far fewer tokens than a screenshot.
+
+```bash
+ccu tree --app mousepad                  # one line per element, grouped by app
+ccu tree --app mousepad --role button    # "button" matches push_button, toggle_button, ...
+ccu tree --name save                     # case-insensitive substring of the name
+ccu click_element "Save As" --shot       # clicks the element's centre with the real mouse
+ccu click_element "Match case" --role check_box --app mousepad
+ccu click_element OK --timeout 10        # wait up to 10 s for it to appear
+ccu click_element notes.txt --role table_cell --count 2   # double-click a file in a file dialog
+ccu find "search for" --role text        # check an element exists / read its text and states
+ccu tree --apps                          # which apps have a tree
+```
+
+Output lines look like `check_box "Match case" @329,318 433x23 [checked]`: role, name, **centre** `@X,Y` in screenshot pixels, size, notable states (`focused`, `checked`, `selected`, `expanded`, `disabled`, ...), and `text="..."` for fields and terminals.
+
+- **Use the tree first** for GTK and Qt apps (most Linux apps, including the XFCE panel and terminal). Scope it with `--app` (and `--role`/`--name`); an unscoped tree of a busy desktop can cost as much as a screenshot.
+- **Fall back to pixels** when `ccu tree --app X` shows nothing or only a `frame`: plain X11 apps, Wine apps, games, and Chromium/Electron apps started without `--force-renderer-accessibility`. If you launch a Chromium-based or Electron app yourself, add that flag: `ccu launch 'app --no-sandbox --force-renderer-accessibility'`.
+- **Matching:** case-insensitive; an exact name wins over substrings. If several elements match, the command fails and lists them. Then add `--role`/`--app`, or `--index N` (0-based) to pick one. Unnamed fields go by their label, e.g. `text "Search for:"`.
+- `click_element` raises the element's window first if another app's window covers it. If the element is showing but off the screen (a dialog taller than the screen), the error says so; then `--action` invokes the element's own action without the mouse.
+- Still take a screenshot (`--shot`) after actions that change the screen a lot, and to check things the tree doesn't show (images, colours, layout). Use `ccu find` or a narrow `ccu tree` to check small changes such as a checkbox state or a field's text.
+- GTK 4 apps (GNOME apps) report positions relative to their window; `ccu` converts them, but positions inside GTK 4 popovers can be off. If a click lands wrong there, use pixels.
 
 ## Tips
 
@@ -135,4 +160,4 @@ The user can start the desktop with limited network access: `ccu up --egress all
 
 ## MCP alternative
 
-The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.
+The same controls are also available as MCP tools: `screenshot`, `click`, `type_text`, `key`, `launch`, `install`, `ui_tree`, `find_element`, `click_element`, and others. Register them with `claude mcp add containercomp -- ccu mcp`. If those tools (`mcp__containercomp__*`) are present, you can use them instead of the CLI. They return screenshots inline, without a file read. The MCP server only connects while the container is running, so if its tools are missing, run `ccu up` and use the CLI.

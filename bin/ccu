@@ -96,7 +96,8 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
-UI elements (accessibility tree: GTK apps, Qt and Chromium/Electron apps; not Wine)
+UI elements (accessibility tree: GTK and Qt apps, Chromium/Electron started with
+--force-renderer-accessibility; not plain X11 or, most likely, Wine apps)
   tree [--app A] [--role R] [--name N] [--all] [--hidden] [--limit N] [--json]
                         one line per element: role "name" @CX,CY WxH [states]
                         (@CX,CY is its centre in screenshot pixels); --apps lists apps

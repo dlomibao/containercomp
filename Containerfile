@@ -59,13 +59,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
 
 # Accessibility tree (`ccu tree`, `ccu click_element`): the AT-SPI client
 # library for Python (cu.py and the MCP server use gi.repository.Atspi).
-# GTK apps register with the AT-SPI bus on their own; Qt and Chromium only do
-# when told to, so turn that on for everything started in the container.
+# GTK 3/4 and Qt 5 apps join the AT-SPI bus on their own; Qt 6 apps only with
+# this variable. Chromium/Electron need --force-renderer-accessibility.
 RUN apt-get update && apt-get install -y --no-install-recommends python3-gi gir1.2-atspi-2.0 \
     && rm -rf /var/lib/apt/lists/*
-ENV QT_ACCESSIBILITY=1 \
-    QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 \
-    ACCESSIBILITY_ENABLED=1
+ENV QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 
 # Python env for the MCP server.
 RUN python3 -m venv --system-site-packages /opt/ccu/venv \
