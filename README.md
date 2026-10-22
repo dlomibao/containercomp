@@ -79,6 +79,7 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
 | `CCU_SCREEN` | `1280x800` | screen size, applied when the container is created |
 | `CCU_PORT` | `6080` / `6081` | host port for noVNC (always bound to 127.0.0.1) |
 | `CCU_NAME` | `ccu` / `ccu-x86` | container name |
+| `CCU_IMAGE` | `localhost/containercomp:<target>` | image tag to build and run |
 | `VNC_PASSWORD` | *(none)* | require a password in the viewer |
 | `CCU_SHOT_DIR` | `$TMPDIR/ccu` | where screenshots are saved |
 

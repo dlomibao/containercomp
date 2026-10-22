@@ -62,7 +62,7 @@ Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
 
 Add --shot to any control command to take a screenshot afterwards and print its path.
 
-Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_SHOT_DIR,
+Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_NAME, CCU_IMAGE, CCU_SHOT_DIR,
 VNC_PASSWORD (applied when the container is created).
 EOF
 }
@@ -75,7 +75,7 @@ set_target() {
         x86|amd64) TARGET=x86; PLATFORM=linux/amd64; NAME=${CCU_NAME:-ccu-x86}; PORT=${CCU_PORT:-6081} ;;
         *) die "unknown target '$TARGET' (use native or x86)" ;;
     esac
-    IMAGE=localhost/containercomp:$TARGET
+    IMAGE=${CCU_IMAGE:-localhost/containercomp:$TARGET}
 }
 
 state() { podman container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing; }
