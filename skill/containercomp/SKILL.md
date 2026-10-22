@@ -157,10 +157,55 @@ ccu reset --base                     # back to the clean image
 ```
 
 - **Before a risky change** (an untrusted installer, a big config change, an upgrade), save a snapshot first so it can be undone with `ccu reset --from NAME`.
-- **For repeatable tests**, set the app up once, save a snapshot, and run `ccu reset` before each test run so every run starts from the identical state. Report which snapshot you used.
+- **For repeatable tests**, set the app up once, save a snapshot, and run `ccu reset` before each test run so every run starts from the identical state, or let `ccu test run` do the resets (see "Repeatable tests"). Report which snapshot you used.
 - Open windows aren't saved, only files. After a reset, launch the app again. If an app might be writing files, close it or save in it before you snapshot.
 - Names are letters, digits, `.`, `_` and `-`. `save` refuses to overwrite an existing name unless you pass `--force`.
 - **Ask the user before you delete a snapshot** (`ccu snapshot rm`) or overwrite one with `--force`. Snapshots may hold setup work that took them a long time. Saving snapshots, and resetting between test runs the user asked for, are fine without asking.
+
+## Repeatable tests (`ccu test`)
+
+When the user wants an app behavior tested repeatedly, or wants a result they can rerun or put in CI, write a test spec instead of only driving the app by hand. `ccu test run` resets the desktop before every run, so each run starts from the same state.
+
+```bash
+ccu test run spec.yaml                       # one run; exit code 0 = passed
+ccu test run spec.yaml --repeat 3            # flakiness check: three runs, each from a fresh reset
+ccu test run spec.yaml --no-reset            # quick iteration on the current desktop while writing it
+ccu test validate spec.yaml                  # lists every problem in the spec, without running it
+ccu test draft > spec.yaml                   # spec draft from what you just did by hand
+```
+
+A spec is YAML. Each item is a one-key mapping `- action: arguments`. A list fills the arguments in order, and a single value is the first argument:
+
+```yaml
+name: Mousepad saves a note
+from: base                 # snapshot to reset to ("base" = clean image); omit = the snapshot the container came from
+setup:                     # bring the app to the starting point; failures here mark the run as an error
+  - check: {file: {path: ~/note.txt, exists: false}}
+  - launch: mousepad
+  - wait_window: Mousepad
+steps:
+  - click: [300, 200]
+  - type: "Hello\n"        # \n presses Return
+  - key: ctrl+s            # or a list: [ctrl+a, Delete]
+  - wait_window: Save As
+  - type: /home/user/note.txt
+    name: file name        # optional label for the report
+  - key: Return
+checks:                    # each check is retried for up to 5 s (check_timeout), and all are evaluated
+  - window: {title: note.txt - Mousepad, active: true}
+  - file: {path: ~/note.txt, contains: Hello}
+  - shell: {run: "grep -c Hello ~/note.txt", matches: "^1$"}
+  - text: {text: Hello, region: [0, 0, 1280, 400]}     # OCR
+```
+
+- Steps: `launch`, `wait_window`, `focus`, `click` (also `double_click`, `right_click`, ...) `[x, y]` or `{x, y, button, count, mods}`, `move`, `drag`, `scroll`, `type`, `key`, `wait`, `shell` (fails on a non-zero exit), `screenshot`, `click_element`/`wait_element` `{name, role, app}`, and `check: {...}` for an assertion between steps.
+- Checks: `window` (`title` substring or `matches` regex; `active`, `exists: false`), `file` (`exists`, `contains`, `matches`, `equals`), `shell` (`exit`, `contains`, `matches` on stdout), `text` (OCR; `region`, `matches`, `absent: true`), `element` (accessibility tree; `role`, `states`, `exists: false`). Every item also takes `optional: true`; waits and checks take `timeout:` (seconds).
+- Make specs robust: `wait_window` after every launch and before typing into a dialog; prefer keys and typed paths over clicks; prefer `file`/`shell`/`window` checks over `text` (OCR can misread, so keep `text` checks to short, distinct phrases and give a `region`); put state you need in a snapshot (`from:`), not in long setup. Add a setup check that fails if the previous run's output is still there, so a missed reset shows up.
+- Accessibility steps (`click_element`, `element`) fail with "accessibility support not available in this image" on images without it. Use coordinates and OCR there.
+
+**Reading results.** `ccu test run` prints a line per item and, at the end, the path of `index.html` in the results directory (`summary.json` and `junit.xml` sit next to it). For a failure, read `summary.json`: each run lists its `failures` (which item, and why: the OCR text seen, the open windows, the file contents) and a `screenshot` path of the first failing item. Read that PNG to see the screen at that point. Each run directory also has `result.json` with every item, `shots/` (one screenshot per item), `audit/` (that run's audit log entries) and `reset.log`. Report to the user which checks failed and why, with the results path. Don't loosen a check just to get a pass unless the user agrees that the expectation was wrong.
+
+**Turning a manual session into a spec.** After doing a task by hand with `ccu` commands: run `ccu test draft > spec.yaml`. It replays your launches, clicks, keys and `ccu exec` commands, and adds a `wait_window` wherever the active window changed. Then edit it: typed text shows up as `"TODO"` (the audit log only keeps its length), so fill it in. Replace coordinates that depend on window layout with keys or `click_element` where possible, drop exploratory steps, and add `checks` for the outcome the user cares about. Then `ccu test validate`, and `ccu test run` it until it passes twice in a row (`--repeat 2`). An example that passes: `examples/mousepad.yaml` in the containercomp repo.
 
 ## Safety
 

@@ -65,6 +65,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends python3-gi gir1
     && rm -rf /var/lib/apt/lists/*
 ENV QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1
 
+# Test runner (`ccu test`): YAML specs, and OCR for "text is on screen" checks.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-yaml tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
+
 # Python env for the MCP server.
 RUN python3 -m venv --system-site-packages /opt/ccu/venv \
     && /opt/ccu/venv/bin/pip install --no-cache-dir "mcp>=1.2,<2"
