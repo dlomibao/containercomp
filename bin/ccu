@@ -472,7 +472,8 @@ snap_save() {
         pause=true
     fi
     echo "saving $NAME ($s) as snapshot '$name'..." >&2
-    # The runtime env (VNC_PASSWORD) is cleared so it doesn't travel with exports.
+    # Runtime env (VNC_PASSWORD, proxy settings) is cleared: it does not travel
+    # with exports, and `up` sets it again for the new container's network mode.
     podman commit -q --pause="$pause" \
         -c 'ENV VNC_PASSWORD=""' \
         -c 'ENV CCU_EGRESS_PROXY="" http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" no_proxy="" NO_PROXY=""' \
