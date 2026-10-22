@@ -1,0 +1,111 @@
+#!/bin/bash
+# ccu-install: install apps into the container. Runs as root.
+#
+#   ccu-install <apt-package>...          apt packages
+#   ccu-install /path/to/file.deb          local .deb (dependencies resolved by apt)
+#   ccu-install /path/to/App.AppImage      AppImage -> /usr/local/bin/<name>
+#   ccu-install /path/to/setup.exe|.msi    run the Windows installer under Wine (GUI)
+#   ccu-install /path/to/archive.tar.gz    extract into ~user/apps/<name>/
+#   ccu-install https://host/file.ext      download, then handle as above
+#
+# Anything else is copied into ~user/apps/.
+set -euo pipefail
+
+USER_NAME=user
+APPS=/home/$USER_NAME/apps
+mkdir -p "$APPS"
+chown "$USER_NAME:$USER_NAME" "$APPS"
+
+as_user() {
+    local envfile=/home/$USER_NAME/.cache/ccu/session.env
+    sudo -u "$USER_NAME" -H bash -c "[ -f $envfile ] && . $envfile; export DISPLAY=${DISPLAY:-:1}; $*"
+}
+
+apt_ready() {
+    # Refresh package lists if missing or older than an hour.
+    if [ -z "$(find /var/lib/apt/lists -maxdepth 1 -name '*_Packages' -mmin -60 2>/dev/null | head -1)" ]; then
+        apt-get update -q
+    fi
+}
+
+stem() {
+    local base
+    base=$(basename "$1")
+    base=${base%.tar.gz}; base=${base%.tar.xz}; base=${base%.tar.bz2}; base=${base%.tgz}
+    echo "${base%.*}"
+}
+
+install_file() {
+    local f=$1 lower name
+    lower=$(echo "$f" | tr '[:upper:]' '[:lower:]')
+    name=$(stem "$f")
+    case "$lower" in
+        *.deb)
+            apt_ready
+            apt-get install -y "$f"
+            echo "installed $(basename "$f")"
+            ;;
+        *.appimage)
+            chmod +x "$f"
+            local slug
+            slug=$(echo "$name" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]\+/-/g; s/-[0-9].*$//; s/^-//; s/-$//')
+            # Extract-and-run avoids needing FUSE inside the container.
+            cat > "/usr/local/bin/$slug" <<EOF
+#!/bin/sh
+APPIMAGE_EXTRACT_AND_RUN=1 exec "$f" "\$@"
+EOF
+            chmod +x "/usr/local/bin/$slug"
+            echo "installed AppImage: run with \`$slug\` (Electron apps may need --no-sandbox)"
+            ;;
+        *.exe|*.msi)
+            if ! command -v wine >/dev/null; then
+                echo "ccu-install: Wine is not in this image; use the x86 target (ccu -t x86 ...)" >&2
+                return 1
+            fi
+            local cmd="wine \"$f\""
+            case "$lower" in *.msi) cmd="wine msiexec /i \"$f\"" ;; esac
+            as_user "nohup $cmd >/home/$USER_NAME/.cache/ccu/wine-install.log 2>&1 &"
+            echo "started Windows installer under Wine; finish it on the desktop (log: ~/.cache/ccu/wine-install.log)"
+            ;;
+        *.tar.gz|*.tgz|*.tar.xz|*.tar.bz2|*.tar|*.zip|*.7z)
+            local dest="$APPS/$name"
+            mkdir -p "$dest"
+            case "$lower" in
+                *.zip) unzip -q -o "$f" -d "$dest" ;;
+                *.7z) 7z x -y -o"$dest" "$f" >/dev/null ;;
+                *) tar -xf "$f" -C "$dest" ;;
+            esac
+            chown -R "$USER_NAME:$USER_NAME" "$dest"
+            echo "extracted to $dest"
+            ;;
+        *)
+            echo "copied to $f"
+            ;;
+    esac
+}
+
+if [ "$#" -eq 0 ]; then
+    sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+fi
+
+pkgs=()
+for arg in "$@"; do
+    if [[ "$arg" =~ ^https?:// ]]; then
+        fname=$(basename "${arg%%\?*}")
+        [ -n "$fname" ] || fname=download
+        echo "downloading $arg"
+        curl -fL --retry 2 -o "$APPS/$fname" "$arg"
+        chown "$USER_NAME:$USER_NAME" "$APPS/$fname"
+        install_file "$APPS/$fname"
+    elif [ -f "$arg" ]; then
+        install_file "$arg"
+    else
+        pkgs+=("$arg")
+    fi
+done
+
+if [ "${#pkgs[@]}" -gt 0 ]; then
+    apt_ready
+    apt-get install -y --no-install-recommends "${pkgs[@]}"
+fi

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Block until the X server on $DISPLAY accepts connections (max ~30s).
+for _ in $(seq 1 60); do
+    xdpyinfo -display "${DISPLAY:-:1}" >/dev/null 2>&1 && exit 0
+    sleep 0.5
+done
+echo "wait-x: X server ${DISPLAY:-:1} not ready" >&2
+exit 1

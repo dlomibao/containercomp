@@ -1,0 +1,20 @@
+#!/bin/bash
+# Container entrypoint: optional VNC password, then hand off to supervisord.
+set -euo pipefail
+
+mkdir -p /var/log/ccu
+chown user:user /var/log/ccu
+# Stale from a previous run; start-desktop rewrites it and ccu waits for it.
+rm -f /home/user/.cache/ccu/session.env
+
+if [ -n "${VNC_PASSWORD:-}" ]; then
+    x11vnc -storepasswd "$VNC_PASSWORD" /etc/ccu-vncpass >/dev/null
+    export X11VNC_AUTH="-rfbauth /etc/ccu-vncpass"
+else
+    export X11VNC_AUTH="-nopw"
+fi
+
+if [ "$#" -gt 0 ]; then
+    exec "$@"
+fi
+exec /usr/bin/supervisord -n -c /etc/supervisor/supervisord.conf

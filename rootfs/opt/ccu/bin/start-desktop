@@ -1,0 +1,11 @@
+#!/bin/bash
+# Start an XFCE session and publish its D-Bus address so apps launched later
+# via `podman exec` (cu launch) join the same session bus.
+set -eu
+/opt/ccu/bin/wait-x
+
+mkdir -p "$HOME/.cache/ccu"
+eval "$(dbus-launch --sh-syntax)"
+printf 'export DBUS_SESSION_BUS_ADDRESS=%q\n' "$DBUS_SESSION_BUS_ADDRESS" > "$HOME/.cache/ccu/session.env"
+
+exec startxfce4

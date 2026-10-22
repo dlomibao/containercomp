@@ -1,0 +1,284 @@
+#!/bin/bash
+# ccu: run and control the containercomp desktop from the Mac host.
+# Run `ccu help` for usage.
+set -euo pipefail
+
+# Resolve the repo root through symlinks (macOS bash 3.2 has no readlink -f guarantee).
+src=${BASH_SOURCE[0]}
+while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case "$src" in /*) ;; *) src=$dir/$src ;; esac
+done
+REPO=$(cd -P "$(dirname "$src")/.." && pwd)
+
+TARGET=${CCU_TARGET:-native}
+SHOT_DIR=${CCU_SHOT_DIR:-${TMPDIR:-/tmp}/ccu}
+SCREEN=${CCU_SCREEN:-1280x800}
+
+usage() {
+    cat <<'EOF'
+ccu: a Linux desktop in a Podman container, driven by mouse/keyboard/screenshots.
+
+usage: ccu [-t native|x86] <command> [args]
+
+  -t native   arm64 Ubuntu desktop (default, fast)
+  -t x86      amd64 Ubuntu desktop under emulation, with Wine for Windows apps
+              (or set CCU_TARGET=x86)
+
+Lifecycle
+  build                 build (or rebuild) the image
+  up                    start the desktop (builds the image first if needed)
+  down                  stop the container (state is kept)
+  rm                    delete the container (state is lost; the image stays)
+  status                show container status and the viewer URL
+  open                  open the noVNC viewer in your browser
+  logs [service]        desktop logs (xvfb, desktop, x11vnc, novnc)
+  shell [--root]        interactive shell in the container
+  exec [--root] CMD...  run a command in the container
+  mcp                   stdio MCP server (for `claude mcp add containercomp -- ccu mcp`)
+
+Apps and files
+  install TARGET...     apt package names, URLs, or host files (.deb, .AppImage,
+                        .exe/.msi on x86, archives); host files go to ~/apps
+  cp-in HOST [DEST]     copy a host file into the container (default ~/apps/)
+  cp-out SRC [HOST]     copy a container file to the host (default: current dir)
+
+Screen control (coordinates are screen pixels; screenshot pixels = click pixels)
+  screenshot [FILE]     save a PNG, print its path
+  zoom X0 Y0 X1 Y1 [--scale N] [FILE]   enlarged crop of a region
+  click X Y [--button left|right|middle] [--mods ctrl+shift]
+  double_click X Y | triple_click X Y | right_click X Y | middle_click X Y
+  move X Y              mouse_down | mouse_up
+  drag X0 Y0 X1 Y1
+  scroll X Y up|down|left|right [AMOUNT]
+  type TEXT             newlines press Return
+  key COMBO...          xdotool names: ctrl+s Return Escape Tab alt+F4 super
+  launch CMD...         start a GUI app in the background
+  windows | active | size | cursor
+  focus TITLE           raise the window whose title contains TITLE
+  wait_window TITLE [--timeout S]
+  wait SECONDS
+
+Add --shot to any control command to take a screenshot afterwards and print its path.
+
+Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_SHOT_DIR,
+VNC_PASSWORD (applied when the container is created).
+EOF
+}
+
+die() { echo "ccu: $*" >&2; exit 1; }
+
+set_target() {
+    case "$TARGET" in
+        native|arm64) TARGET=native; PLATFORM=linux/arm64; NAME=${CCU_NAME:-ccu}; PORT=${CCU_PORT:-6080} ;;
+        x86|amd64) TARGET=x86; PLATFORM=linux/amd64; NAME=${CCU_NAME:-ccu-x86}; PORT=${CCU_PORT:-6081} ;;
+        *) die "unknown target '$TARGET' (use native or x86)" ;;
+    esac
+    IMAGE=localhost/containercomp:$TARGET
+}
+
+state() { podman container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing; }
+
+require_running() {
+    [ "$(state)" = running ] || die "container '$NAME' is not running; start it with: ccu${TARGET_FLAG} up"
+}
+
+# podman exec as the desktop user with the display env.
+pexec() {
+    podman exec -u user -w /home/user -e DISPLAY=:1 "$NAME" "$@"
+}
+
+ensure_machine() {
+    # On macOS podman needs its Linux VM running.
+    if [ "$(uname -s)" = Darwin ] && ! podman info >/dev/null 2>&1; then
+        echo "starting podman machine..." >&2
+        podman machine start >/dev/null 2>&1 || podman machine init --now \
+            || die "could not start the podman machine; run 'podman machine init --now' manually"
+    fi
+}
+
+cmd_build() {
+    ensure_machine
+    echo "building $IMAGE ($PLATFORM); the x86 build is slow under emulation" >&2
+    podman build --platform "$PLATFORM" -t "$IMAGE" -f "$REPO/Containerfile" "$REPO"
+}
+
+wait_ready() {
+    local i
+    for i in $(seq 1 90); do
+        if pexec xdotool getdisplaygeometry >/dev/null 2>&1 && pexec test -f /home/user/.cache/ccu/session.env; then
+            # Give the panel and window manager a moment to map.
+            sleep 2
+            return 0
+        fi
+        sleep 1
+    done
+    die "desktop did not come up; check: ccu${TARGET_FLAG} logs desktop"
+}
+
+cmd_up() {
+    ensure_machine
+    case "$(state)" in
+        running) ;;
+        missing)
+            podman image exists "$IMAGE" || cmd_build
+            local w=${SCREEN%x*} h=${SCREEN#*x}
+            podman run -d --name "$NAME" --hostname "$NAME" \
+                --platform "$PLATFORM" \
+                -p "127.0.0.1:$PORT:6080" \
+                --shm-size 2g \
+                -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
+                -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
+                --label containercomp.target="$TARGET" \
+                "$IMAGE" >/dev/null
+            ;;
+        *) podman start "$NAME" >/dev/null ;;
+    esac
+    wait_ready
+    echo "desktop '$NAME' is up: $(pexec cu size | tr ' ' x) at http://localhost:$PORT/"
+}
+
+cmd_status() {
+    local s
+    s=$(state)
+    echo "target:    $TARGET ($PLATFORM)"
+    echo "container: $NAME ($s)"
+    echo "image:     $IMAGE ($(podman image exists "$IMAGE" && echo present || echo 'not built'))"
+    if [ "$s" = running ]; then
+        echo "viewer:    http://localhost:$PORT/"
+        echo "screen:    $(pexec cu size | tr ' ' x)"
+        echo "windows:"
+        pexec cu windows | sed 's/^/  /'
+    fi
+}
+
+new_shot_path() {
+    mkdir -p "$SHOT_DIR"
+    echo "$SHOT_DIR/$NAME-$(date +%Y%m%d-%H%M%S)-$$-$RANDOM.png"
+}
+
+cmd_screenshot() {
+    local out=${1:-$(new_shot_path)}
+    pexec cu screenshot > "$out"
+    [ -s "$out" ] || die "screenshot failed"
+    echo "$out"
+}
+
+cmd_zoom() {
+    local args=() out=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --scale) args+=("$1" "$2"); shift 2 ;;
+            *.png) out=$1; shift ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ -n "$out" ] || out=$(new_shot_path)
+    pexec cu zoom "${args[@]}" > "$out"
+    [ -s "$out" ] || die "zoom failed"
+    echo "$out"
+}
+
+cmd_install() {
+    [ $# -gt 0 ] || die "usage: ccu install <apt-package|url|host-file>..."
+    local targets=() a dest
+    for a in "$@"; do
+        if [ -f "$a" ]; then
+            dest=/home/user/apps/$(basename "$a")
+            podman exec "$NAME" mkdir -p /home/user/apps
+            podman cp "$a" "$NAME:$dest"
+            podman exec "$NAME" chown user:user /home/user/apps "$dest"
+            targets+=("$dest")
+        else
+            targets+=("$a")
+        fi
+    done
+    podman exec -e DISPLAY=:1 "$NAME" /usr/local/bin/ccu-install "${targets[@]}"
+}
+
+cmd_cp_in() {
+    [ $# -ge 1 ] || die "usage: ccu cp-in HOST_PATH [CONTAINER_DEST]"
+    local dest=${2:-/home/user/apps/}
+    podman exec "$NAME" mkdir -p /home/user/apps
+    podman cp "$1" "$NAME:$dest"
+    podman exec "$NAME" chown -R user:user /home/user/apps
+    case "$dest" in /home/user/*) podman exec "$NAME" chown -R user:user "$dest" ;; esac
+    echo "copied to $dest"
+}
+
+cmd_cp_out() {
+    [ $# -ge 1 ] || die "usage: ccu cp-out CONTAINER_PATH [HOST_DEST]"
+    local src=$1
+    case "$src" in /*) ;; *) src=/home/user/$src ;; esac
+    podman cp "$NAME:$src" "${2:-.}"
+}
+
+# --- main ---------------------------------------------------------------------
+
+TARGET_FLAG=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -t|--target) TARGET=$2; TARGET_FLAG=" -t $2"; shift 2 ;;
+        --target=*) TARGET=${1#*=}; TARGET_FLAG=" -t ${1#*=}"; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) break ;;
+    esac
+done
+set_target
+[ $# -gt 0 ] || { usage; exit 1; }
+cmd=$1; shift
+
+# --shot: screenshot after a control command.
+SHOT=0
+if [ $# -gt 0 ]; then
+    rest=()
+    for a in "$@"; do
+        if [ "$a" = --shot ]; then SHOT=1; else rest+=("$a"); fi
+    done
+    set -- ${rest[@]+"${rest[@]}"}
+fi
+
+case "$cmd" in
+    help) usage ;;
+    build) cmd_build ;;
+    up|start) cmd_up ;;
+    down|stop) podman stop -t 5 "$NAME" >/dev/null && echo "stopped $NAME" ;;
+    rm|reset) podman rm -f "$NAME" >/dev/null && echo "removed $NAME" ;;
+    status) cmd_status ;;
+    open) require_running; open "http://localhost:$PORT/" ;;
+    logs)
+        require_running
+        if [ $# -gt 0 ]; then podman exec "$NAME" tail -n 200 "/var/log/ccu/$1.log"
+        else podman logs --tail 200 "$NAME"; fi
+        ;;
+    shell)
+        require_running
+        if [ "${1:-}" = --root ]; then podman exec -it -e DISPLAY=:1 "$NAME" bash
+        else podman exec -it -u user -w /home/user -e DISPLAY=:1 "$NAME" bash -l; fi
+        ;;
+    exec)
+        require_running
+        if [ "${1:-}" = --root ]; then shift; podman exec -e DISPLAY=:1 "$NAME" "$@"
+        else pexec "$@"; fi
+        ;;
+    mcp)
+        # Don't auto-start: Claude Code spawns MCP servers at every session start.
+        require_running
+        exec podman exec -i -u user -w /home/user -e DISPLAY=:1 "$NAME" /opt/ccu/venv/bin/python /opt/ccu/mcp_server.py
+        ;;
+    install) require_running; cmd_install "$@" ;;
+    cp-in) require_running; cmd_cp_in "$@" ;;
+    cp-out) require_running; cmd_cp_out "$@" ;;
+    screenshot) require_running; cmd_screenshot "$@" ;;
+    zoom) require_running; cmd_zoom "$@" ;;
+    click|double_click|triple_click|right_click|middle_click|move|mouse_down|mouse_up|drag|scroll|type|key|launch|focus|wait_window|wait|windows|active|size|cursor)
+        require_running
+        pexec cu "$cmd" "$@"
+        if [ "$SHOT" = 1 ]; then
+            sleep 0.6
+            cmd_screenshot
+        fi
+        ;;
+    *) die "unknown command '$cmd' (see: ccu help)" ;;
+esac
