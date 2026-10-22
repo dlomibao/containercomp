@@ -12,7 +12,8 @@ while [ -L "$src" ]; do
 done
 REPO=$(cd -P "$(dirname "$src")/.." && pwd)
 
-TARGET=${CCU_TARGET:-native}
+TARGET_REQ=${CCU_TARGET:-}   # empty: the desktop's own target, else native
+NAME_REQ=${CCU_NAME:-}       # empty: ccu (native) or ccu-x86
 SHOT_DIR=${CCU_SHOT_DIR:-${TMPDIR:-/tmp}/ccu}
 SCREEN=${CCU_SCREEN:-1280x800}
 
@@ -32,11 +33,15 @@ usage() {
     cat <<'EOF'
 ccu: a Linux desktop in a Podman container, driven by mouse/keyboard/screenshots.
 
-usage: ccu [-t native|x86] <command> [args]
+usage: ccu [-n NAME] [-t native|x86] <command> [args]
 
+  -n NAME     which desktop (or set CCU_NAME); default ccu, or ccu-x86 with -t x86.
+              Each name is its own container with its own viewer port, so
+              several desktops can run at once. Letters, digits, '.', '_', '-'.
   -t native   arm64 Ubuntu desktop (default, fast)
   -t x86      amd64 Ubuntu desktop under emulation, with Wine for Windows apps
-              (or set CCU_TARGET=x86)
+              (or set CCU_TARGET=x86). Only needed when creating a desktop:
+              an existing one remembers its target.
 
 Lifecycle
   build                 build (or rebuild) the image
@@ -50,11 +55,13 @@ Lifecycle
                         recreate the container from the snapshot it came from
                         (or another snapshot, or the base image) and start it
   status                show container status and the viewer URL
+  ls                    list all desktops: name, target, state, viewer, snapshot, egress
   open                  open the noVNC viewer in your browser
   logs [service]        desktop logs (xvfb, desktop, x11vnc, novnc)
   shell [--root]        interactive shell in the container
   exec [--root] CMD...  run a command in the container
-  mcp                   stdio MCP server (for `claude mcp add containercomp -- ccu mcp`)
+  mcp                   stdio MCP server (for `claude mcp add containercomp -- ccu mcp`;
+                        one per desktop: `claude mcp add ccu-foo -- ccu -n foo mcp`)
 
 Snapshots (images named <image>-snap-NAME; pin a known-good state, reset to it)
   snapshot save NAME [-m DESC] [--force]   commit the container (paused if running)
@@ -112,8 +119,9 @@ Network (egress allowlist; chosen when the container is created)
   "*.example.com" or ".example.com" allows it and all subdomains; # comments.
   Only proxy-aware traffic (HTTP_PROXY/HTTPS_PROXY are preset) gets out.
 
-Environment: CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT, CCU_NAME,
-CCU_IMAGE, CCU_SHOT_DIR, VNC_PASSWORD (applied when the container is created).
+Environment: CCU_NAME, CCU_TARGET, CCU_SCREEN (default 1280x800), CCU_PORT (default
+6080/6081 or the next free port), CCU_IMAGE, CCU_SHOT_DIR, VNC_PASSWORD (screen, port,
+image and password apply when the container is created).
 Audit: CCU_AUDIT (1|0), CCU_AUDIT_SHOTS (1|0), CCU_AUDIT_MAX_SHOTS (500),
 CCU_AUDIT_TYPE (length|hash|full), CCU_AUDIT_MIRROR (host file or off), CCU_RECORD_FPS (5).
 Network: CCU_EGRESS (FILE or "offline", same as up --egress), CCU_EGRESS_IMAGE,
@@ -124,13 +132,57 @@ EOF
 
 die() { echo "ccu: $*" >&2; exit 1; }
 
+# Resolve NAME, TARGET, PLATFORM, IMAGE and PORT. An existing desktop's labels
+# say which target and base image it was created with, so `-n NAME` finds an
+# x86 desktop without -t; its port binding says where its viewer is.
 set_target() {
-    case "$TARGET" in
-        native|arm64) TARGET=native; PLATFORM=linux/arm64; NAME=${CCU_NAME:-ccu}; PORT=${CCU_PORT:-6080} ;;
-        x86|amd64) TARGET=x86; PLATFORM=linux/amd64; NAME=${CCU_NAME:-ccu-x86}; PORT=${CCU_PORT:-6081} ;;
-        *) die "unknown target '$TARGET' (use native or x86)" ;;
+    local t=${TARGET_REQ:-native} info lt li lp
+    case "$t" in
+        native|arm64) t=native ;;
+        x86|amd64) t=x86 ;;
+        *) die "unknown target '$t' (use native or x86)" ;;
     esac
-    IMAGE=${CCU_IMAGE:-localhost/containercomp:$TARGET}
+    if [ -n "$NAME_REQ" ]; then check_name "$NAME_REQ"; NAME=$NAME_REQ
+    elif [ "$t" = x86 ]; then NAME=ccu-x86
+    else NAME=ccu; fi
+    info=$(podman container inspect -f '{{index .Config.Labels "containercomp.target"}}|{{index .Config.Labels "containercomp.image"}}|{{range $p, $b := .HostConfig.PortBindings}}{{range $b}}{{.HostPort}}{{end}}{{end}}' "$NAME" 2>/dev/null) || info=""
+    IFS='|' read -r lt li lp <<< "$info"
+    if [ -n "$lt" ] && [ "$lt" != "$t" ]; then
+        [ -z "$TARGET_REQ" ] || die "'$NAME' is an existing $lt desktop; drop -t/CCU_TARGET or pick another name"
+        t=$lt
+    fi
+    case "$t" in
+        native) TARGET=native; PLATFORM=linux/arm64; DEFAULT_PORT=6080 ;;
+        x86) TARGET=x86; PLATFORM=linux/amd64; DEFAULT_PORT=6081 ;;
+        *) die "desktop '$NAME' has an unknown target '$t'" ;;
+    esac
+    IMAGE=${CCU_IMAGE:-${li:-localhost/containercomp:$TARGET}}
+    # CCU_PORT applies when the desktop is created; empty: `up` picks a free one.
+    PORT=${lp:-${CCU_PORT:-}}
+}
+
+# Desktop names become container, host and network names.
+check_name() {
+    case "$1" in
+        [!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) die "bad desktop name '$1' (use letters, digits, '.', '_', '-')" ;;
+        *-egress) die "desktop names can't end in -egress (the egress proxy of '${1%-egress}' uses it)" ;;
+    esac
+    [ ${#1} -le 48 ] || die "desktop name is longer than 48 characters"
+}
+
+# Is something on the host listening on 127.0.0.1:$1?
+port_listening() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+
+# First port from $1 up that no container has claimed (running or not) and
+# nothing on the host is listening on.
+free_port() {
+    local p=$1 claimed
+    claimed=" $(podman ps -a --format '{{.Ports}}' | grep -oE ':[0-9]+->' | tr -d ':>-' | tr '\n' ' ')"
+    while [ "$p" -lt $(($1 + 100)) ]; do
+        case "$claimed" in *" $p "*) ;; *) port_listening "$p" || { echo "$p"; return 0; } ;; esac
+        p=$((p + 1))
+    done
+    die "no free viewer port in $1-$((p - 1)); set CCU_PORT"
 }
 
 state() { podman container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing; }
@@ -165,6 +217,7 @@ ensure_machine() {
         echo "starting podman machine..." >&2
         podman machine start >/dev/null 2>&1 || podman machine init --now \
             || die "could not start the podman machine; run 'podman machine init --now' manually"
+        MACHINE_STARTED=1
     fi
 }
 
@@ -216,6 +269,8 @@ cmd_up() {
     done
     if [ "$nrest" -gt 0 ]; then egress_parse_up "${rest[@]}"; else egress_parse_up; fi
     ensure_machine
+    # The desktop's labels couldn't be read while the machine was down.
+    [ -z "${MACHINE_STARTED:-}" ] || set_target
     check_rosetta
     if [ -n "$from" ]; then
         snap_require "$from"
@@ -230,23 +285,37 @@ cmd_up() {
         missing)
             [ -n "$from" ] || podman image exists "$IMAGE" || cmd_build
             egress_create
-            local w=${SCREEN%x*} h=${SCREEN#*x}
+            local w=${SCREEN%x*} h=${SCREEN#*x} auto=0 tries=0 err
             proxy_opts -e
             # In egress mode the egress proxy is the only way out; don't pass the
             # host's proxy settings in on top of it.
             if [ -n "$EGRESS_REQ" ]; then PROXY_OPTS=(--http-proxy=false); fi
-            podman run -d --name "$NAME" --hostname "$NAME" \
+            # Without CCU_PORT: the target's default viewer port, or the next free one.
+            if [ -z "$PORT" ]; then PORT=$(free_port "$DEFAULT_PORT"); auto=1; fi
+            while ! err=$(podman run -d --name "$NAME" --hostname "$NAME" \
                 --platform "$PLATFORM" \
                 -p "127.0.0.1:$PORT:6080" \
                 --shm-size 2g \
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
                 -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
                 -e CCU_INSTANCE="$(new_instance_id)" \
+                --label containercomp.desktop=1 \
                 --label containercomp.target="$TARGET" \
+                --label containercomp.image="$IMAGE" \
                 --label containercomp.from="$from" \
                 ${PROXY_OPTS[@]+"${PROXY_OPTS[@]}"} \
                 ${EGRESS_ARGS[@]+"${EGRESS_ARGS[@]}"} \
-                "$run_image" >/dev/null
+                "$run_image" 2>&1 >/dev/null); do
+                case "$err" in *"address already in use"*|*"proxy already running"*) ;; *) die "could not create '$NAME': $err" ;; esac
+                # The port was taken (another desktop can grab it between the
+                # check and the start). The container was created but not started.
+                podman rm -f "$NAME" >/dev/null 2>&1 || true
+                tries=$((tries + 1))
+                [ "$auto" = 1 ] && [ "$tries" -lt 5 ] || die "port $PORT is in use; set CCU_PORT to a free port"
+                echo "port $PORT is in use; trying another" >&2
+                PORT=$(free_port $((PORT + 1)))
+            done
+            [ -z "$err" ] || printf '%s\n' "$err" >&2
             ;;
         *) podman start "$NAME" >/dev/null ;;
     esac
@@ -287,6 +356,29 @@ cmd_status_from() {
     else
         echo "from:      snapshot '$from' ($ref)"
     fi
+}
+
+# Every desktop: containers that ccu labeled containercomp.desktop, plus the
+# default ccu/ccu-x86 desktops created before that label existed.
+cmd_ls() {
+    ensure_machine
+    local fmt='{{.Names}}|{{.State}}|{{.Image}}|{{index .Labels "containercomp.desktop"}}|{{index .Labels "containercomp.target"}}|{{index .Labels "containercomp.from"}}|{{index .Labels "containercomp.egress"}}|{{.Ports}}'
+    printf '%-20s %-7s %-8s %-24s %-16s %s\n' NAME TARGET STATE VIEWER FROM EGRESS
+    podman ps -a --format "$fmt" | sort -t "|" -k 1,1 | while IFS='|' read -r n st img desk t from eg ports; do
+        if [ -z "$desk" ]; then
+            case "$n:$img" in ccu:localhost/containercomp:*|ccu-x86:localhost/containercomp:*) ;; *) continue ;; esac
+            [ -n "$t" ] || { t=native; [ "$n" = ccu ] || t=x86; }
+        fi
+        ports=$(printf '%s\n' "$ports" | sed -nE 's/.*:([0-9]+)->6080\/tcp.*/http:\/\/localhost:\1\//p')
+        PROXY=$n-egress
+        if [ -z "$eg" ]; then eg=unrestricted
+        elif ! podman container exists "$PROXY"; then eg="filtered (proxy missing)"
+        else
+            eg=$(egress_cat /etc/squid/allowlist.txt | grep -c . || true)
+            if [ "$eg" = 0 ]; then eg=offline; else eg="allowlist ($eg)"; fi
+        fi
+        printf '%-20s %-7s %-8s %-24s %-16s %s\n' "$n" "$t" "$st" "${ports:--}" "${from:-base}" "$eg"
+    done
 }
 
 # Unique per created container. A container made from a snapshot inherits the
@@ -502,6 +594,7 @@ snap_save() {
         -c 'ENV CCU_EGRESS_PROXY="" http_proxy="" https_proxy="" HTTP_PROXY="" HTTPS_PROXY="" no_proxy="" NO_PROXY="" all_proxy="" ALL_PROXY=""' \
         -c "LABEL containercomp.target=\"$TARGET\"" \
         -c 'LABEL containercomp.egress=""' \
+        -c 'LABEL containercomp.desktop=""' \
         -c "LABEL containercomp.snapshot=\"$name\"" \
         -c "LABEL containercomp.snapshot.base=\"$IMAGE\"" \
         -c "LABEL containercomp.snapshot.parent=\"$(snap_from)\"" \
@@ -1009,11 +1102,14 @@ cmd_certs() {
 
 # --- main ---------------------------------------------------------------------
 
+# TARGET_FLAG repeats -t/-n in the hints that ccu prints.
 TARGET_FLAG=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        -t|--target) TARGET=$2; TARGET_FLAG=" -t $2"; shift 2 ;;
-        --target=*) TARGET=${1#*=}; TARGET_FLAG=" -t ${1#*=}"; shift ;;
+        -t|--target) TARGET_REQ=$2; TARGET_FLAG+=" -t $2"; shift 2 ;;
+        --target=*) TARGET_REQ=${1#*=}; TARGET_FLAG+=" -t ${1#*=}"; shift ;;
+        -n|--name) [ $# -ge 2 ] || die "usage: ccu -n NAME <command>"; NAME_REQ=$2; TARGET_FLAG+=" -n $2"; shift 2 ;;
+        --name=*) NAME_REQ=${1#*=}; TARGET_FLAG+=" -n ${1#*=}"; shift ;;
         -h|--help) usage; exit 0 ;;
         *) break ;;
     esac
@@ -1043,6 +1139,7 @@ case "$cmd" in
     reset) cmd_reset "$@" ;;
     snapshot|snap) cmd_snapshot "$@" ;;
     status) cmd_status ;;
+    ls|list) cmd_ls ;;
     open) require_running; open "http://localhost:$PORT/" ;;
     logs)
         require_running

@@ -5,6 +5,7 @@ A Linux desktop in a Podman container that [Claude Code](https://claude.com/clau
 - **Ubuntu 24.04 + XFCE** on Xvfb, with `xdotool` for input and `scrot` for screenshots
 - **noVNC viewer** at `http://localhost:6080/`, so you can watch the agent or take over
 - **Two targets**: `native` (arm64, fast) and `x86` (amd64 under emulation, with **Wine** for Windows apps)
+- **Several desktops at once**, each with its own name and viewer port (`ccu -n NAME ...`), so parallel agents or test runs don't share a screen
 - **`ccu` CLI** on the host that wraps everything through `podman exec`
 - **Claude Code skill** (`skill/containercomp`) that teaches Claude the screenshot → act → verify loop
 - **MCP server** (optional) inside the container that exposes the same controls as tools
@@ -46,9 +47,9 @@ Then ask Claude Code something like *"Install inkscape in the container and draw
 ## CLI
 
 ```text
-ccu [-t native|x86] <command>
+ccu [-n NAME] [-t native|x86] <command>
 
-Lifecycle   build | up [--from SNAP] | down | rm | reset [--from SNAP | --base] | status | open
+Lifecycle   build | up [--from SNAP] | down | rm | reset [--from SNAP | --base] | status | open | ls
             logs [svc] | shell [--root] | exec [--root] CMD | mcp
 Snapshots   snapshot save NAME [-m DESC] [--force] | list | rm NAME... | export NAME FILE | import FILE [NAME]
 Apps        install <apt-pkg|url|host-file>...   cp-in HOST [DEST]   cp-out SRC [HOST]
@@ -79,11 +80,11 @@ Network     up --egress FILE | up --offline   egress [status] | egress log [-f] 
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CCU_TARGET` | `native` | `native` (arm64) or `x86` (amd64 + Wine) |
+| `CCU_NAME` | `ccu` / `ccu-x86` | desktop (container) name, same as `-n` (see [Several desktops at once](#several-desktops-at-once)) |
+| `CCU_TARGET` | `native` | `native` (arm64) or `x86` (amd64 + Wine), same as `-t`; an existing desktop keeps the target it was created with |
 | `CCU_SCREEN` | `1280x800` | screen size, applied when the container is created |
-| `CCU_PORT` | `6080` / `6081` | host port for noVNC (always bound to 127.0.0.1) |
-| `CCU_NAME` | `ccu` / `ccu-x86` | container name |
-| `CCU_IMAGE` | `localhost/containercomp:<target>` | base image; snapshots are named `<image>-snap-NAME` |
+| `CCU_PORT` | `6080` / `6081`, or the next free port | host port for noVNC (always bound to 127.0.0.1), applied when the container is created |
+| `CCU_IMAGE` | the desktop's base image, else `localhost/containercomp:<target>` | base image; snapshots are named `<image>-snap-NAME` |
 | `VNC_PASSWORD` | *(none)* | require a password in the viewer |
 | `CCU_SHOT_DIR` | `$TMPDIR/ccu` | where screenshots are saved |
 | `CCU_EGRESS` | *(none)* | allowlist file or `offline`, same as `ccu up --egress` (see [Restricting network access](#restricting-network-access)) |
@@ -97,7 +98,31 @@ Keep the screen around 1280x800 or smaller. Larger screenshots get downscaled be
 claude mcp add -s user containercomp -- ccu mcp
 ```
 
-Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`.
+Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. Each server drives one desktop. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`, and for a named one, one per name: `claude mcp add -s user ccu-foo -- ccu -n foo mcp` (its tools show up as `mcp__ccu-foo__*`).
+
+## Several desktops at once
+
+Every desktop has a name. Without `-n` it's `ccu` (native) or `ccu-x86` (`-t x86`), as before. Give another name to run more desktops side by side, for example one per agent or per test run:
+
+```bash
+ccu -n tests up --from golden     # a new native desktop, from a snapshot
+ccu -n winapp -t x86 up           # a new x86 desktop
+ccu ls
+NAME                 TARGET  STATE    VIEWER                   FROM             EGRESS
+ccu                  native  running  http://localhost:6080/   base             unrestricted
+tests                native  running  http://localhost:6082/   golden           unrestricted
+winapp               x86     running  http://localhost:6083/   base             unrestricted
+ccu -n tests screenshot           # every command takes -n (or CCU_NAME)
+ccu -n winapp install ~/Downloads/setup.msi   # no -t needed: the desktop remembers it is x86
+```
+
+- **Names** are letters, digits, `.`, `_` and `-` (up to 48 characters, not ending in `-egress`). The name is the container's name and host name. The egress proxy (`NAME-egress`), its network (`NAME-internal`), the audit mirror (`~/.local/state/ccu/audit/NAME.jsonl`), screenshots and recordings (`$CCU_SHOT_DIR/NAME-*`) are all per desktop.
+- **Target and base image are remembered.** A desktop's labels record the target and base image it was created with, so `-t` and `CCU_IMAGE` are only needed with `up` for a new desktop. A `-t` (or `CCU_TARGET`) that contradicts an existing desktop is an error, not a silent switch.
+- **Ports.** A new desktop gets its target's default port (6080 native, 6081 x86), or the next free one above it when that's taken by another desktop (running or stopped) or anything else listening on 127.0.0.1. Later commands read the port back from the container, `reset` keeps it, and `ccu ls`/`ccu status` show it. An explicit `CCU_PORT` still wins, and `up` fails if that port is in use.
+- **Snapshots** belong to the base image, not to a desktop, so any desktop of that image can use them: save `golden` from one desktop and start others with `ccu -n NAME up --from golden` or `ccu -n NAME reset --from golden`.
+- **`ccu ls`** lists desktops created by `ccu` (they carry the label `containercomp.desktop`) plus `ccu` and `ccu-x86` from older versions. A desktop created under another name by an older `ccu` still works with `-n` but isn't listed until it's recreated.
+- Each desktop is a full XFCE session. An idle native one used about 150–350 MB of RAM in testing; apps add to that, and x86 under emulation costs more CPU. Size the Podman machine for the number you run at once.
+- There's no `--all`: `down`, `rm` and `reset` act on one desktop. To stop several, name them: `for n in a b c; do ccu -n $n down; done`.
 
 ## Audit and recording
 
