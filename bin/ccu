@@ -235,12 +235,14 @@ cmd_up() {
             # In egress mode the egress proxy is the only way out; don't pass the
             # host's proxy settings in on top of it.
             if [ -n "$EGRESS_REQ" ]; then PROXY_OPTS=(--http-proxy=false); fi
-            podman run -d --name "$NAME" --hostname "$NAME" \
+            # VNC_PASSWORD is passed by name, so it isn't on the podman command
+            # line (visible in ps) or in the container's CreateCommand.
+            VNC_PASSWORD=${VNC_PASSWORD:-} podman run -d --name "$NAME" --hostname "$NAME" \
                 --platform "$PLATFORM" \
                 -p "127.0.0.1:$PORT:6080" \
                 --shm-size 2g \
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
-                -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
+                -e VNC_PASSWORD \
                 -e CCU_INSTANCE="$(new_instance_id)" \
                 --label containercomp.target="$TARGET" \
                 --label containercomp.from="$from" \

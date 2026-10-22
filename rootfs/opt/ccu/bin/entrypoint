@@ -24,12 +24,20 @@ fi
 # Point sudo and apt at the egress proxy when ccu runs in --egress mode.
 /opt/ccu/bin/egress-env
 
+# The password file lives on tmpfs so it never ends up in a snapshot, and is
+# owned by the user x11vnc runs as (a root-only file locks everyone out).
+# Images before this kept it in /etc.
+rm -f /etc/ccu-vncpass
 if [ -n "${VNC_PASSWORD:-}" ]; then
-    x11vnc -storepasswd "$VNC_PASSWORD" /etc/ccu-vncpass >/dev/null
-    export X11VNC_AUTH="-rfbauth /etc/ccu-vncpass"
+    x11vnc -storepasswd "$VNC_PASSWORD" /dev/shm/ccu-vncpass >/dev/null 2>&1
+    chown user:user /dev/shm/ccu-vncpass
+    chmod 0400 /dev/shm/ccu-vncpass
+    export X11VNC_AUTH="-rfbauth /dev/shm/ccu-vncpass"
 else
     export X11VNC_AUTH="-nopw"
 fi
+# Keep it out of the desktop session's environment (and the apps it starts).
+unset VNC_PASSWORD
 
 if [ "$#" -gt 0 ]; then
     exec "$@"
