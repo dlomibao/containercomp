@@ -35,6 +35,7 @@ IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's l
 - **Options:** (a) run it on the default machine with a test CA and remove it afterwards; (b) a throwaway machine; (c) skip it.
 - **Why:** (a) briefly makes the VM trust a CA whose private key sits in a temp directory. (b) has no such window, but only one machine can run at a time, so it has to wait until nothing else is running.
 - **Review:** The final summary says whether this happened.
+- **Outcome:** Not run. A second machine can only run while `podman-machine-default` is stopped, which would have stopped the maintainer's running desktop. `certs sync --machine` remains untested.
 
 ## D5. The CI and prebuilt-image work waits on a local branch until the token can push workflows
 
