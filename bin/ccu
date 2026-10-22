@@ -75,7 +75,7 @@ set_target() {
         x86|amd64) TARGET=x86; PLATFORM=linux/amd64; NAME=${CCU_NAME:-ccu-x86}; PORT=${CCU_PORT:-6081} ;;
         *) die "unknown target '$TARGET' (use native or x86)" ;;
     esac
-    IMAGE=localhost/containercomp:$TARGET
+    IMAGE=${CCU_IMAGE:-localhost/containercomp:$TARGET}
 }
 
 state() { podman container inspect -f '{{.State.Status}}' "$NAME" 2>/dev/null || echo missing; }
