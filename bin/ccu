@@ -111,6 +111,13 @@ Clipboard (the desktop's CLIPBOARD selection; --primary for PRIMARY)
   clip push | pull      copy the Mac clipboard into the desktop / back (text or PNG)
   clip targets          data types it currently holds
 
+Secrets (macOS login Keychain items named ccu-secret.KEY; see README "Secrets")
+  secret type KEY       type the secret into the focused field; the value never
+                        reaches argv, the audit log (key and length only) or files
+  secret env KEY VAR -- CMD...   run CMD in the container with VAR set to the
+                        secret; the value is masked in CMD's output
+  secret list           key names | secret set KEY (prompts) | secret rm KEY
+
 Audit and recording (every action is logged; see README "Audit and recording")
   audit tail [N]        last N audit log entries (JSONL)
   audit verify          check the log's hash chain and compare it with the host mirror
@@ -616,6 +623,94 @@ cmd_clip() {
             rm -rf "$tmp"
             ;;
         *) die "$CLIP_USAGE" ;;
+    esac
+}
+
+# --- secrets (macOS login Keychain) -----------------------------------------------
+# Only generic passwords named ccu-secret.KEY (account $USER) are used, so a
+# secret is typed into the desktop only if someone stored it for that purpose.
+# The value goes from `security` straight into a pipe to `cu secret` in the
+# container: never into a variable, a command line, a file or the audit log.
+# (`-g` rather than `-w`: -w prints non-ASCII values as bare hex.)
+
+SECRET_PREFIX=ccu-secret.
+SECRET_USAGE="usage: ccu secret list | set KEY | rm KEY | type KEY | env KEY VAR -- CMD..."
+
+secret_check_name() {
+    [ "$(uname -s)" = Darwin ] || die "ccu secret reads the macOS login Keychain, so it only works on a Mac"
+    case "${1:-}" in
+        "") die "missing secret name ($SECRET_USAGE)" ;;
+        [!A-Za-z0-9]*|*[!A-Za-z0-9_.-]*) die "bad secret name '$1' (use letters, digits, '.', '_', '-')" ;;
+    esac
+    [ ${#1} -le 64 ] || die "secret name is longer than 64 characters"
+}
+
+secret_require() {
+    secret_check_name "$1"
+    security find-generic-password -a "$USER" -s "$SECRET_PREFIX$1" >/dev/null 2>&1 \
+        || die "no Keychain item '$SECRET_PREFIX$1' (account $USER); the user can store one with: ccu secret set $1"
+}
+
+# Key names only: attributes of matching items, never their data.
+secret_list() {
+    [ "$(uname -s)" = Darwin ] || die "ccu secret reads the macOS login Keychain, so it only works on a Mac"
+    security dump-keychain login.keychain-db 2>/dev/null | awk -v p="\"svce\"<blob>=\"$SECRET_PREFIX" -v a="\"acct\"<blob>=\"$USER\"" '
+        /^keychain: / { if (s != "" && ok) print s; s = ""; ok = 0 }
+        index($0, p) { s = substr($0, index($0, p) + length(p)); sub(/"$/, "", s) }
+        index($0, a) { ok = 1 }
+        END { if (s != "" && ok) print s }' | sort -u
+}
+
+# Prompt without echo (or read one line from a pipe) and store the value.
+# It is handed to `security` on stdin, not as an argument.
+secret_set() {
+    [ $# -eq 1 ] || die "usage: ccu secret set KEY (prompts for the value, or reads one line from stdin)"
+    secret_check_name "$1"
+    local v="" v2="" out
+    if [ -t 0 ]; then
+        read -rs -p "value for $SECRET_PREFIX$1: " v; echo >&2
+        read -rs -p "again: " v2; echo >&2
+        [ "$v" = "$v2" ] || die "the values don't match; nothing stored"
+    else
+        IFS= read -r v || true
+    fi
+    [ -n "$v" ] || die "empty value; nothing stored"
+    out=$(printf '%s\n%s\n' "$v" "$v" | security add-generic-password -U -a "$USER" -s "$SECRET_PREFIX$1" \
+        -l "$SECRET_PREFIX$1" -j "containercomp: may be typed into the ccu desktop (ccu secret type $1)" -w 2>&1) \
+        || die "security add-generic-password failed: $out"
+    v=""; v2=""
+    echo "stored $SECRET_PREFIX$1 in the login Keychain"
+}
+
+cmd_secret() {
+    local sub=${1:-list} key var
+    [ $# -eq 0 ] || shift
+    case "$sub" in
+        list) [ $# -eq 0 ] || die "$SECRET_USAGE"; secret_list ;;
+        set) secret_set "$@" ;;
+        rm)
+            [ $# -eq 1 ] || die "usage: ccu secret rm KEY"
+            secret_require "$1"
+            security delete-generic-password -a "$USER" -s "$SECRET_PREFIX$1" >/dev/null 2>&1 \
+                || die "could not remove $SECRET_PREFIX$1"
+            echo "removed $SECRET_PREFIX$1 from the login Keychain"
+            ;;
+        type)
+            [ $# -eq 1 ] || die "usage: ccu secret type KEY"
+            require_running
+            secret_require "$1"
+            security find-generic-password -a "$USER" -s "$SECRET_PREFIX$1" -g 2>&1 >/dev/null | pexec_in cu secret --keychain type "$1"
+            if [ "$SHOT" = 1 ]; then sleep 0.6; cmd_screenshot; fi
+            ;;
+        env)
+            [ $# -ge 4 ] && [ "$3" = -- ] || die "usage: ccu secret env KEY VAR -- CMD..."
+            key=$1; var=$2; shift 3
+            case "$var" in [!A-Za-z_]*|*[!A-Za-z0-9_]*) die "bad variable name '$var'" ;; esac
+            require_running
+            secret_require "$key"
+            security find-generic-password -a "$USER" -s "$SECRET_PREFIX$key" -g 2>&1 >/dev/null | pexec_in cu secret --keychain env "$key" "$var" -- "$@"
+            ;;
+        *) die "$SECRET_USAGE" ;;
     esac
 }
 
@@ -1276,6 +1371,7 @@ case "$cmd" in
     audit) require_running; cmd_audit "$@" ;;
     record) require_running; cmd_record "$@" ;;
     clip) require_running; cmd_clip "$@" ;;
+    secret) cmd_secret "$@" ;;
     click|double_click|triple_click|right_click|middle_click|move|mouse_down|mouse_up|drag|scroll|type|key|launch|focus|wait_window|wait|windows|active|size|cursor)
         require_running
         pexec cu "$cmd" "$@"

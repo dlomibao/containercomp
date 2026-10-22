@@ -141,6 +141,7 @@ ccu reset --base                     # back to the clean image
 
 - The container is a sandbox. Root in it is fine; root on the Mac is not. Never run `ccu exec --root` commands that are aimed at host paths.
 - Don't type the user's real passwords, tokens or payment details into apps in the container unless the user asks you to in this conversation.
+- **Logins:** when an app needs a password or token, use `ccu secret type KEY` (or `ccu secret env KEY VAR -- CMD...` for CLI tools) with a key from `ccu secret list`. The value never enters your context or the logs. Before typing, take a screenshot and click the password field, so the secret doesn't land in a username, search or chat field. Never try to read, print, copy or screenshot a secret's value, and don't use `security` directly. If the key the task needs isn't listed, ask the user to store it with `ccu secret set KEY` in their own terminal; never ask them to paste a secret into the chat.
 - Get confirmation before purchases, sending messages, or other irreversible actions that a GUI app might take on the user's behalf.
 
 ## Audit log and recording
