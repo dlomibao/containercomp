@@ -60,11 +60,35 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             focus TITLE   wait_window TITLE [--timeout S]   wait S
             (append --shot to any screen command to screenshot afterwards)
 Clipboard   clip get | set TEXT|- | paste TEXT|- | push | pull | targets   [--primary] [--type image/png]
+Elements    tree [--app A] [--role R] [--name N] [--all] [--hidden] [--json] | tree --apps
+            find NAME [--role R] [--app A] [--timeout S]   click_element NAME [--role R] [--app A] [--count N] [--action]
 Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
 Network     up --egress FILE | up --offline   egress [status] | egress log [-f] [--all] | egress set FILE|offline
 ```
 
 `ccu screenshot` saves a PNG and prints its path, which Claude then reads. Screenshots are at native resolution (default 1280x800), so a pixel in the screenshot is the pixel you click.
+
+### UI elements (accessibility tree)
+
+Apps that support AT-SPI publish their widgets with a role, a name, a state and a position. `ccu tree` lists them and `ccu click_element` clicks one by name, so the agent can skip guessing pixels, and reading a scoped tree costs far fewer tokens than a screenshot.
+
+```console
+$ ccu tree --app mousepad --role check_box
+# app mousepad pid 167
+check_box "Wrap around" @360,286 107x34 [checked]
+check_box "Match case" @329,318 433x23
+$ ccu click_element "match case" --shot
+clicked mousepad: check_box "Match case" @329,318 433x23
+$ ccu find "search for" --role text --json      # one element as JSON
+```
+
+- Each line is `role "name" @CX,CY WxH [states] text="..."`. `@CX,CY` is the centre in screen pixels, which are the same as screenshot pixels. States list only the notable ones (`focused`, `checked`, `selected`, `expanded`, `active`, `editable`, `disabled`, ...); `--json` gives everything (`x`, `y` are the top-left corner).
+- **Matching:** names are compared case-insensitively, with runs of whitespace collapsed and `…` read as `...`. An exact match wins; only when nothing matches exactly do substring matches count. If more than one element is left, `find`/`click_element` fail and list the candidates; narrow with `--role`/`--app` or pick one with `--index N` (0-based, in tree order). `--timeout S` waits for the element to appear.
+- **Roles** are AT-SPI role names with `_` for spaces: `push_button`, `toggle_button`, `check_box`, `menu`, `menu_item`, `text`, `entry`, `label`, `table_cell`, `page_tab`, `frame`, `dialog`. A role filter also matches the last word of a role, so `--role button` matches every `*_button`.
+- `--app` is a substring of the app's AT-SPI name (usually the program name); `ccu tree --apps` lists them. Unnamed, textless layout containers are left out unless you pass `--all`; elements not showing on screen are left out unless you pass `--hidden`. Unnamed fields take the name of their label (`text "Search for:"`).
+- **Clicking:** `click_element` moves the real mouse to the element's centre and clicks (`--button`, `--count 2` for a double-click). If a window of another app covers that spot, it first raises the element's window. `--action` instead runs the element's own AT-SPI action (press/click/activate/toggle). That also works for elements that are showing but off the screen (for example the buttons of a dialog taller than the screen), but it sends no mouse events.
+- **Which apps:** tested with GTK 3 (Mousepad, xfce4-terminal, the XFCE panel), GTK 4 (GNOME Calculator), Qt 5 (FeatherPad), Qt 6 (PyQt6) and Electron 32. Qt 6 apps need `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, which the image sets. **Chromium and Electron apps expose only their window frame unless started with `--force-renderer-accessibility`** (`ccu launch 'app --no-sandbox --force-renderer-accessibility'`). GTK 4 can't report screen positions on X11, so `cu` adds its window-relative positions to the window's origin; GTK 4 popovers may come out misplaced. Plain X11 apps (tested: `xmessage`) have no tree, and Wine apps, Java apps and apps that draw their own widgets (games) most likely don't either (not tested); use screenshots for those.
+- Speed: one app takes 20–160 ms to walk in the container (plus ~0.2 s for `podman exec`), the whole desktop with five apps open about 0.3 s. Walks stop at 5000 nodes and 40 levels.
 
 ### What `ccu install` handles
 
@@ -99,7 +123,7 @@ Keep the screen around 1280x800 or smaller. Larger screenshots get downscaled be
 claude mcp add -s user containercomp -- ccu mcp
 ```
 
-Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `clipboard_get`, `clipboard_set`, `launch`, `focus_window`, `install`, `shell`, `wait`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. Each server drives one desktop. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`, and for a named one, one per name: `claude mcp add -s user ccu-foo -- ccu -n foo mcp` (its tools show up as `mcp__ccu-foo__*`).
+Tools: `screenshot`, `zoom`, `screen_info`, `click`, `move_mouse`, `drag`, `scroll`, `type_text`, `key`, `clipboard_get`, `clipboard_set`, `launch`, `focus_window`, `install`, `shell`, `wait`, and for the accessibility tree `ui_tree` (compact text, as `ccu tree`), `find_element` and `click_element`. Action tools accept `screenshot: true` to return a screenshot right after the action. `ccu mcp` does not start the container itself, because Claude Code launches MCP servers at every session start. Run `ccu up` first, then `/mcp` → reconnect if Claude Code started before the container did. Each server drives one desktop. For the x86 desktop, register a second server: `claude mcp add -s user containercomp-x86 -- ccu -t x86 mcp`, and for a named one, one per name: `claude mcp add -s user ccu-foo -- ccu -n foo mcp` (its tools show up as `mcp__ccu-foo__*`).
 
 ## Several desktops at once
 
@@ -315,7 +339,7 @@ It installs the same CAs as `/etc/pki/ca-trust/source/anchors/containercomp.pem`
 ```
 Containerfile                 image definition (one file, both targets)
 bin/ccu                       host CLI
-rootfs/opt/ccu/cu.py          in-container control library + CLI (`cu`)
+rootfs/opt/ccu/cu.py          in-container control library + CLI (`cu`), incl. the AT-SPI tree
 rootfs/opt/ccu/mcp_server.py  MCP server (FastMCP, stdio)
 rootfs/opt/ccu/ccu_audit.py   audit log, `cu exec`, screen recording
 rootfs/usr/local/bin/ccu-install   app installer (apt/deb/AppImage/Wine/archives)

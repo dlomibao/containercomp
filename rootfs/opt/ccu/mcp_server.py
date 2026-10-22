@@ -23,7 +23,10 @@ mcp = FastMCP(
         "Controls a Linux desktop (Ubuntu 24.04, XFCE) running in a container. "
         "Call screenshot first, then act using pixel coordinates from that screenshot. "
         "Take another screenshot after actions to verify the result. Prefer keyboard "
-        "shortcuts when reliable. Use zoom to read small text."
+        "shortcuts when reliable. Use zoom to read small text. For GTK, Qt and "
+        "Chromium/Electron apps, ui_tree (scoped by app/role/name) lists buttons, "
+        "fields and menu items with their positions and states for far fewer tokens, "
+        "and click_element clicks one by name; fall back to pixels when it lists nothing."
     ),
     log_level="WARNING",
 )
@@ -195,6 +198,60 @@ def shell(command: str, timeout: float = 120.0) -> str:
         out = (proc.stdout + proc.stderr)[-8000:]
         ev.update(ok=proc.returncode == 0, result={"exit": proc.returncode, "output": out})
     return f"exit {proc.returncode}\n{out}"
+
+
+@mcp.tool()
+def ui_tree(
+    app: str = "",
+    role: str = "",
+    name: str = "",
+    limit: int = 100,
+    include_hidden: bool = False,
+    all_nodes: bool = False,
+) -> str:
+    """List UI elements from the accessibility tree, one compact line each:
+    role "name" @CX,CY WxH [states] text="...". @CX,CY is the element's centre in
+    screen pixels (the same as screenshot pixels). Far cheaper than a screenshot
+    when scoped: pass app (e.g. "mousepad"; see screen_info for windows), role
+    (push_button, menu_item, check_box, text, ...; "button" matches every
+    *_button) and/or name (case-insensitive substring). Works for GTK and Qt
+    apps, and Chromium/Electron apps launched with --force-renderer-accessibility;
+    plain X11 apps (and most likely Wine apps) show nothing, so use screenshots
+    for those."""
+    els = cu.elements(app or None, role or None, name or None, not include_hidden, limit, all_nodes)
+    return cu.format_tree(els, limit)
+
+
+@mcp.tool()
+def find_element(name: str, role: str = "", app: str = "", timeout: float = 0.0,
+                 index: int | None = None) -> str:
+    """Return the one element whose name matches (case-insensitive; an exact
+    name wins over substrings), waiting up to `timeout` seconds for it to
+    appear. Errors list the candidates when several match; narrow with
+    role/app or pick one with index (0-based)."""
+    return cu.format_element(cu.find_element(name, role or None, app or None, timeout, index), with_app=True)
+
+
+@mcp.tool()
+def click_element(
+    name: str,
+    role: str = "",
+    app: str = "",
+    button: str = "left",
+    count: int = 1,
+    index: int | None = None,
+    timeout: float = 0.0,
+    use_action: bool = False,
+    screenshot: bool = False,
+):
+    """Click the centre of the element whose name matches (as find_element),
+    with the real mouse. Prefer this to pixel clicks when ui_tree lists the
+    element. count: 2 for a double-click. use_action=True invokes the
+    element's accessibility action instead (works when it is covered or off
+    the screen, but sends no mouse events)."""
+    el = cu.click_element(name, role or None, app or None, button, count, index, timeout, use_action)
+    verb = "invoked" if use_action else f"clicked {button} x{count}"
+    return _done(f"{verb} {cu.format_element(el, with_app=True)}", screenshot)
 
 
 @mcp.tool()

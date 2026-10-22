@@ -111,6 +111,17 @@ Clipboard (the desktop's CLIPBOARD selection; --primary for PRIMARY)
   clip push | pull      copy the Mac clipboard into the desktop / back (text or PNG)
   clip targets          data types it currently holds
 
+UI elements (accessibility tree: GTK and Qt apps, Chromium/Electron started with
+--force-renderer-accessibility; not plain X11 or, most likely, Wine apps)
+  tree [--app A] [--role R] [--name N] [--all] [--hidden] [--limit N] [--json]
+                        one line per element: role "name" @CX,CY WxH [states]
+                        (@CX,CY is its centre in screenshot pixels); --apps lists apps
+  find NAME [--role R] [--app A] [--timeout S] [--index I] [--json]
+  click_element NAME [--role R] [--app A] [--button B] [--count N] [--index I]
+                [--timeout S] [--action]   click the element's centre
+  NAME matches case-insensitively: an exact name wins, otherwise a substring.
+  A role matches itself or its last word: "button" matches push_button.
+
 Audit and recording (every action is logged; see README "Audit and recording")
   audit tail [N]        last N audit log entries (JSONL)
   audit verify          check the log's hash chain and compare it with the host mirror
@@ -617,6 +628,17 @@ cmd_clip() {
             ;;
         *) die "$CLIP_USAGE" ;;
     esac
+}
+
+# --- accessibility tree ---------------------------------------------------------
+
+# tree / find / click_element: cu reads the AT-SPI tree inside the container.
+cmd_element() {
+    pexec cu "$@"
+    if [ "$SHOT" = 1 ]; then
+        sleep 0.6
+        cmd_screenshot
+    fi
 }
 
 # --- snapshots ----------------------------------------------------------------
@@ -1284,5 +1306,6 @@ case "$cmd" in
             cmd_screenshot
         fi
         ;;
+    tree|find|click_element) require_running; cmd_element "$cmd" "$@" ;;
     *) die "unknown command '$cmd' (see: ccu help)" ;;
 esac
