@@ -132,6 +132,7 @@ The user can start the desktop with limited network access: `ccu up --egress all
 - **Blocked requests are by design.** Don't work around them: no `--noproxy`, unsetting proxy variables, raw IPs, other DNS servers, tunnels, mirrors on allowed hosts, or changing network settings as root. The block is enforced outside the container, so those attempts only waste time, and trying them goes against what the user asked for.
 - When something fails, run `ccu egress log` to see exactly which hosts were blocked. Then tell the user which domains the task needs and why, and ask them to extend the allowlist. They can run `ccu egress set <file>` without recreating the desktop. Continue once they have done so.
 - Apt on the native (arm64) target needs `ports.ubuntu.com`. The x86 target needs `archive.ubuntu.com` and `security.ubuntu.com`.
+- On a corporate network the egress proxy may forward through the company's proxy (`ccu egress` shows an `upstream:` line). If an allowlisted host fails with `503` (or `407`), the problem is the upstream proxy, not the allowlist: tell the user. Don't try to configure proxies inside the desktop, and never ask for or print the proxy password. The user sets it on the host.
 
 ## MCP alternative
 
