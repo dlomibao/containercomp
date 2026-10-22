@@ -32,7 +32,9 @@ ccu install https://example.com/app.tar.gz # downloaded, then extracted to ~/app
 ccu -t x86 install ~/Downloads/setup.exe   # starts the Windows installer on the desktop
 ```
 
-A `.exe` or `.msi` install opens the installer GUI. Finish it with the screen-control loop below.
+A `.exe` or `.msi` install opens the installer GUI. Finish it with the screen-control loop below. Windows programs are installed under `~/.wine/drive_c/Program Files/`. Launch one like this: `ccu -t x86 launch 'wine "C:\Program Files\7-Zip\7zFM.exe"'`. Pass the whole command as one single-quoted string.
+
+On Apple Silicon only **64-bit** Windows programs work. 32-bit ones (`file` reports `PE32 executable`) fail with errors such as `status c0000018` or a qemu crash. If `ccu install` warns that a file is 32-bit, look for the vendor's 64-bit installer or `.msi` instead of retrying. If `ccu -t x86 up` warns that Rosetta is off, tell the user. The fix needs the user's approval because it restarts the Podman VM.
 
 Watch for these:
 - Ubuntu's `firefox` and `chromium` apt packages are snap stubs, and snaps don't work in containers. Install browsers from vendor repos or tarballs instead.

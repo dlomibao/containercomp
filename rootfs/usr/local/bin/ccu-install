@@ -62,6 +62,10 @@ EOF
                 echo "ccu-install: Wine is not in this image; use the x86 target (ccu -t x86 ...)" >&2
                 return 1
             fi
+            if file "$f" | grep -q 'PE32 executable'; then
+                echo "note: $(basename "$f") is a 32-bit Windows program. It runs on real x86 hosts," >&2
+                echo "  but fails under Apple Silicon emulation; prefer a 64-bit installer or .msi there." >&2
+            fi
             local cmd="wine \"$f\""
             case "$lower" in *.msi) cmd="wine msiexec /i \"$f\"" ;; esac
             as_user "nohup $cmd >/home/$USER_NAME/.cache/ccu/wine-install.log 2>&1 &"

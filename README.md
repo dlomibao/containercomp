@@ -24,6 +24,11 @@ A Linux desktop in a Podman container that [Claude Code](https://claude.com/clau
 - macOS (Apple Silicon or Intel) or Linux
 - [Podman](https://podman.io/) 5+ (`brew install podman`). On macOS, `ccu` starts the Podman machine for you. Give it enough memory for GUI apps, for example: `podman machine init --cpus 6 --memory 12288 --now`
 - Claude Code, for the skill and MCP parts
+- For the `x86` target on Apple Silicon, **turn on Rosetta in the Podman machine**. Podman 5.6+ disables it by default because of a kernel bug that Apple fixed in macOS 26, and without it x86 falls back to slow qemu. With qemu, Wine can't load real `.exe` files. `ccu -t x86 up` warns you when Rosetta is off.
+  ```bash
+  podman machine ssh "sudo touch /etc/containers/enable-rosetta"
+  podman machine stop && podman machine start
+  ```
 
 ## Install
 
@@ -99,8 +104,11 @@ podman commit ccu localhost/containercomp:native   # overwrite the base image wi
 
 - **Snaps don't work in containers.** That includes Ubuntu's `firefox` and `chromium` apt packages. Use vendor repos, tarballs or AppImages instead.
 - **Electron and Chromium apps** usually need `--no-sandbox` in a container.
-- **x86 emulation is slow.** On Apple Silicon the amd64 image runs through the Podman machine's binfmt emulation (qemu, or Rosetta if your Podman machine has it active). Fine for installers and lightweight apps, not for heavy ones.
-- **Wine** is the Ubuntu 24.04 package (Wine 9.0) with 32- and 64-bit support plus `winetricks`. App compatibility varies; check [WineHQ AppDB](https://appdb.winehq.org/).
+- **x86 on Apple Silicon** runs through Rosetta (see Requirements). It's fine for installers and everyday apps, though slower than native.
+- **Wine** is the Ubuntu 24.04 package (Wine 9.0) plus `winetricks`, with the Wine prefix already set up in the image.
+  - **64-bit Windows programs work on Apple Silicon.** Tested with the 7-Zip x64 `.msi`: it installs through the GUI and the installed app runs.
+  - **32-bit Windows programs (PE32) don't work on Apple Silicon.** That includes many `setup.exe` stubs, even ones named "x64". They need Wine's 32-bit side, and Rosetta doesn't translate 32-bit Linux code, so it falls back to qemu-i386, which fails. The new-WoW64 Wine in Ubuntu 26.04 and WineHQ's Wine 11 also failed in testing. On a real x86 Linux host, 32-bit programs run normally. Prefer 64-bit installers or `.msi` files; `ccu install` warns when it detects a 32-bit `.exe`.
+  - App compatibility varies; check [WineHQ AppDB](https://appdb.winehq.org/).
 - **No GPU.** Rendering is software-only (llvmpipe).
 - **Security:** the viewer listens only on `127.0.0.1` and has no password by default. The container runs rootless under Podman, so root inside it is not root on your Mac.
 

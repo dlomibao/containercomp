@@ -51,6 +51,12 @@ RUN userdel -r ubuntu 2>/dev/null || true \
     && chmod 0440 /etc/sudoers.d/90-$USERNAME \
     && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix
 
+# Pre-create the Wine prefix: under x86 emulation the first wineboot takes
+# minutes, and otherwise every new container would pay it on first launch.
+RUN if command -v wine >/dev/null; then \
+        su - "$USERNAME" -c 'WINEDEBUG=-all timeout 1200 xvfb-run -a sh -c "wineboot -i && wineserver -w"'; \
+    fi
+
 COPY rootfs/ /
 RUN chmod +x /opt/ccu/bin/* /usr/local/bin/cu /usr/local/bin/ccu-install \
     && mkdir -p /home/$USERNAME/.config/xfce4/xfconf/xfce-perchannel-xml /home/$USERNAME/apps /home/$USERNAME/Desktop \
