@@ -122,6 +122,10 @@ def active_window():
 
 @audit.audited()
 def move(x, y):
+    # --sync waits for a motion event, which never comes if the pointer is
+    # already there (xdotool then stalls ~16s).
+    if cursor_position() == (int(x), int(y)):
+        return
     xdotool("mousemove", "--sync", x, y)
 
 

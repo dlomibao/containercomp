@@ -8,6 +8,19 @@ chown user:user /var/log/ccu
 rm -f /home/user/.cache/ccu/session.env
 /opt/ccu/bin/clean-runtime
 
+# An audit log carried over from a snapshot belongs to another container; move
+# it aside so this container starts a fresh hash chain (seq 1).
+audit=/var/log/ccu/audit
+if [ -n "${CCU_INSTANCE:-}" ] && [ "$(cat "$audit/.instance" 2>/dev/null)" != "$CCU_INSTANCE" ]; then
+    if [ -s "$audit/audit.jsonl" ]; then
+        mkdir -p /var/log/ccu/audit-inherited
+        mv "$audit" "/var/log/ccu/audit-inherited/$(cat "$audit/.instance" 2>/dev/null || echo unknown)-$(date +%Y%m%d%H%M%S)"
+    fi
+    mkdir -p "$audit"
+    echo "$CCU_INSTANCE" > "$audit/.instance"
+    chown -R user:user "$audit"
+fi
+
 if [ -n "${VNC_PASSWORD:-}" ]; then
     x11vnc -storepasswd "$VNC_PASSWORD" /etc/ccu-vncpass >/dev/null
     export X11VNC_AUTH="-rfbauth /etc/ccu-vncpass"

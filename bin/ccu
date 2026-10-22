@@ -205,6 +205,7 @@ cmd_up() {
                 --shm-size 2g \
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
                 -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
+                -e CCU_INSTANCE="$(new_instance_id)" \
                 --label containercomp.target="$TARGET" \
                 --label containercomp.from="$from" \
                 "$run_image" >/dev/null
@@ -246,6 +247,12 @@ cmd_status_from() {
     else
         echo "from:      snapshot '$from' ($ref)"
     fi
+}
+
+# Unique per created container. A container made from a snapshot inherits the
+# snapshot's audit log; the entrypoint archives it when this ID differs.
+new_instance_id() {
+    uuidgen 2>/dev/null | tr 'A-Z' 'a-z' || echo "$(date +%s)-$$-$RANDOM"
 }
 
 new_shot_path() {
