@@ -85,11 +85,12 @@ STEPS = {
     "shell": (["run", "timeout", "root"], ["run"], {"timeout": 60.0, "root": False},
               {"run": "str", "timeout": "num", "root": "bool"}),
     "screenshot": (["label"], [], {}, {"label": "str"}),
-    "click_element": (["name", "role", "app", "button", "count", "timeout"], ["name"],
-                      {"button": "left", "count": 1, "timeout": 10.0},
-                      {"name": "str", "role": "str", "app": "str", "button": "str", "count": "int", "timeout": "num"}),
-    "wait_element": (["name", "role", "app", "timeout"], ["name"], {"timeout": 10.0},
-                     {"name": "str", "role": "str", "app": "str", "timeout": "num"}),
+    "click_element": (["name", "role", "app", "button", "count", "index", "action", "timeout"], ["name"],
+                      {"button": "left", "count": 1, "action": False, "timeout": 10.0},
+                      {"name": "str", "role": "str", "app": "str", "button": "str", "count": "int",
+                       "index": "int", "action": "bool", "timeout": "num"}),
+    "wait_element": (["name", "role", "app", "index", "timeout"], ["name"], {"timeout": 10.0},
+                     {"name": "str", "role": "str", "app": "str", "index": "int", "timeout": "num"}),
     "check": None,  # an inline check: - check: {file: {path: ..., contains: ...}}
 }
 
@@ -102,8 +103,9 @@ CHECKS = {
               {"run": "str", "exit": "int", "contains": "str", "matches": "str", "root": "bool", "timeout": "num"}),
     "text": (["text", "matches", "region", "absent", "timeout"], [], {"absent": False},
              {"text": "str", "matches": "str", "region": "region", "absent": "bool", "timeout": "num"}),
-    "element": (["name", "role", "app", "states", "exists", "timeout"], ["name"], {"exists": True},
-                {"name": "str", "role": "str", "app": "str", "states": "strs", "exists": "bool", "timeout": "num"}),
+    "element": (["name", "role", "app", "index", "states", "exists", "timeout"], ["name"], {"exists": True},
+                {"name": "str", "role": "str", "app": "str", "index": "int", "states": "strs", "exists": "bool",
+                 "timeout": "num"}),
 }
 
 
@@ -376,16 +378,15 @@ def step_shell(a):
 
 
 def step_click_element(a):
-    click_el = _a11y("click_element")
-    find = getattr(cu, "find_element", None)
-    if find and a["timeout"] > 0:
-        find(a["name"], role=a.get("role"), app=a.get("app"), timeout=a["timeout"])
-    el = click_el(a["name"], role=a.get("role"), app=a.get("app"), button=a["button"], count=a["count"])
-    return f"clicked {_el_desc(el) if isinstance(el, dict) else repr(a['name'])}"
+    el = _a11y("click_element")(a["name"], role=a.get("role"), app=a.get("app"), button=a["button"],
+                                count=a["count"], index=a.get("index"), timeout=a["timeout"],
+                                action=a["action"])
+    return f"{'invoked' if a['action'] else 'clicked'} {_el_desc(el) if isinstance(el, dict) else repr(a['name'])}"
 
 
 def step_wait_element(a):
-    el = _a11y("find_element")(a["name"], role=a.get("role"), app=a.get("app"), timeout=a["timeout"])
+    el = _a11y("find_element")(a["name"], role=a.get("role"), app=a.get("app"), timeout=a["timeout"],
+                               index=a.get("index"))
     return f"found {_el_desc(el)}"
 
 
@@ -524,7 +525,7 @@ def check_element(a):
     if a["exists"]:
         find = _a11y("find_element")
         try:
-            el = find(a["name"], role=a.get("role"), app=a.get("app"), timeout=0.0)
+            el = find(a["name"], role=a.get("role"), app=a.get("app"), timeout=0.0, index=a.get("index"))
         except Unavailable:
             raise
         except Exception as e:  # noqa: BLE001 - find_element raises when nothing matches

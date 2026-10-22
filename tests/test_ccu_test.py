@@ -56,7 +56,7 @@ def stub_cu(a11y=True, windows=("note.txt - Mousepad",), active="note.txt - Mous
     if a11y:
         els = [dict(e) for e in elements]
 
-        def find_element(name, role=None, app=None, timeout=0.0):
+        def find_element(name, role=None, app=None, timeout=0.0, index=None):
             for e in els:
                 if e["name"] == name and (role is None or e["role"] == role):
                     return e
@@ -65,8 +65,9 @@ def stub_cu(a11y=True, windows=("note.txt - Mousepad",), active="note.txt - Mous
         def elements_fn(app=None, role=None, name=None, visible_only=True):
             return [e for e in els if (name is None or e["name"] == name) and (role is None or e["role"] == role)]
 
-        def click_element(name, role=None, app=None, button="left", count=1):
-            e = find_element(name, role, app)
+        def click_element(name, role=None, app=None, button="left", count=1, index=None, timeout=0.0,
+                          action=False):
+            e = find_element(name, role, app, timeout, index)
             calls.append(("click_element", (name,), {"role": role, "button": button, "count": count}))
             return e
 

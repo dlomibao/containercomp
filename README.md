@@ -253,6 +253,7 @@ Things to know:
 
 ```bash
 ccu test run examples/mousepad.yaml                  # one run; exit 1 if it fails
+ccu test run examples/mousepad-elements.yaml         # the same app driven by element names
 ccu test run app.yaml --from golden --repeat 5       # 5 runs, each from a fresh copy of "golden"
 ccu test run a.yaml b.yaml --keep-going --record     # don't stop at the first failure; record video
 ccu test run app.yaml --no-reset                     # against the current desktop, while writing a spec
@@ -291,7 +292,7 @@ checks:                   # all are evaluated; each is retried for up to check_t
 | `type` / `key` / `wait` | text (`\n` presses Return) / combo or list of combos / seconds |
 | `shell` | `run`, `timeout` (60), `root`; fails on a non-zero exit |
 | `screenshot` | optional label (every item gets a screenshot anyway) |
-| `click_element` / `wait_element` | `name`, `role`, `app`, `timeout` (10); accessibility tree |
+| `click_element` / `wait_element` | `name`, `role`, `app`, `index`, `timeout` (10); `click_element` also `button`, `count`, `action`; accessibility tree, same matching as `ccu click_element` |
 | `check` | any check, inline: `- check: {file: ~/out.txt}` |
 
 | Checks | Passes when |

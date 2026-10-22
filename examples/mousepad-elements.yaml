@@ -1,0 +1,32 @@
+# Mousepad driven through the accessibility tree instead of pixel coordinates:
+# menus and the Search bar are found by name, so the spec keeps working if the
+# window moves or the theme changes.
+#
+#   ccu test run examples/mousepad-elements.yaml
+name: Mousepad menus by element name
+description: Saves a note through File > Save As..., then opens the Search bar
+  and ticks "Match case", all with click_element.
+from: base
+
+setup:
+  - launch: mousepad
+  - wait_window: Mousepad
+  - wait_element: {name: File, role: menu}
+
+steps:
+  - type: "Hello from the accessibility tree\n"
+  - click_element: {name: File, role: menu}
+  - click_element: {name: Save As..., role: menu_item}
+  - wait_window: Save As
+  - type: /home/user/tree-note.txt
+  - key: Return
+  - wait_window: tree-note.txt
+  - click_element: {name: Search, role: menu}
+  - click_element: {name: Find, role: menu_item}
+  - click_element: {name: Match case, role: check_box}
+
+checks:
+  - file: {path: ~/tree-note.txt, contains: Hello from the accessibility tree}
+  - window: {title: tree-note.txt - Mousepad}
+  - element: {name: Match case, role: check_box, states: [checked]}
+  - element: {name: Save As, role: dialog, exists: false}
