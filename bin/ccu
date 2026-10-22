@@ -320,12 +320,14 @@ cmd_up() {
             if [ -n "$EGRESS_REQ" ]; then PROXY_OPTS=(--http-proxy=false); fi
             # Without CCU_PORT: the target's default viewer port, or the next free one.
             if [ -z "$PORT" ]; then PORT=$(free_port "$DEFAULT_PORT"); auto=1; fi
-            while ! err=$(podman run -d --name "$NAME" --hostname "$NAME" \
+            # VNC_PASSWORD is passed by name, so it isn't on the podman command
+            # line (visible in ps) or in the container's CreateCommand.
+            while ! err=$(VNC_PASSWORD=${VNC_PASSWORD:-} podman run -d --name "$NAME" --hostname "$NAME" \
                 --platform "$PLATFORM" \
                 -p "127.0.0.1:$PORT:6080" \
                 --shm-size 2g \
                 -e SCREEN_WIDTH="$w" -e SCREEN_HEIGHT="$h" \
-                -e VNC_PASSWORD="${VNC_PASSWORD:-}" \
+                -e VNC_PASSWORD \
                 -e CCU_INSTANCE="$(new_instance_id)" \
                 --label containercomp.desktop=1 \
                 --label containercomp.target="$TARGET" \
@@ -1478,8 +1480,11 @@ case "$cmd" in
     shell)
         require_running
         audit_note shell "root=$([ "${1:-}" = --root ] && echo 1 || echo 0)"
-        if [ "${1:-}" = --root ]; then podman exec -it -e DISPLAY=:1 "$NAME" bash
-        else podman exec -it -u user -w /home/user -e DISPLAY=:1 "$NAME" bash -l; fi
+        # Without a terminal (a script or an agent), read commands from stdin and
+        # exit at EOF; with -t, bash would wait forever.
+        tty=-it; [ -t 0 ] || tty=-i
+        if [ "${1:-}" = --root ]; then podman exec $tty -e DISPLAY=:1 "$NAME" bash
+        else podman exec $tty -u user -w /home/user -e DISPLAY=:1 "$NAME" bash -l; fi
         ;;
     exec)
         require_running

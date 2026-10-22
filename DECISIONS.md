@@ -2,7 +2,7 @@
 
 Judgment calls made without the maintainer present, so they can be reviewed afterwards. Each entry says what to check and what the fallback is.
 
-IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's letter: `A` accessibility tree, `B` test runner, `C` multiple desktops, `D` prebuilt images and CI, `E` clipboard and secrets, `G` upstream proxy and gap testing.
+IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's letter: `A` accessibility tree, `B` test runner, `C` multiple desktops, `D` prebuilt images and CI, `E` clipboard and secrets, `G` upstream proxy for egress mode, `H` gap testing. `D-CI` entries belong to prebuilt images and CI.
 
 ## D1. Build the six features in parallel worktrees and merge to main
 
@@ -235,3 +235,45 @@ IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's l
 - **Options:** (a) none; (b) a tool that runs a spec on the current desktop without a reset; (c) a tool that asks the host to reset.
 - **Why:** The reset that makes runs repeatable happens on the host, and the MCP server runs inside the container. (b) would produce results that look repeatable but aren't, and (c) needs a host channel that doesn't exist. Agents that use MCP still have Bash for `ccu test run`.
 - **Review:** If MCP-only clients need it, (b) could be added as `try_spec`, labeled as not resetting.
+
+## H. Gap testing
+
+## H1. Chromium on arm64 comes from the xtradeb PPA, installed by `ccu install chromium`
+
+- **Date:** 2026-10-22
+- **Decision:** `ccu install chromium` adds the xtradeb PPA (key fetched by fingerprint and checked) and pins it so only the `chromium*` packages come from it. `firefox` uses Mozilla's apt repository, and `google-chrome` uses Google's repository on x86 and refuses on arm64.
+- **Options:** (a) the xtradeb PPA deb; (b) Playwright's Chromium build (a zip from Microsoft's CDN, no apt updates, dependencies installed separately); (c) Debian's chromium deb (built for another distribution's libraries); (d) Brave or Vivaldi (vendor arm64 repos, but not Chromium itself); (e) only document a recipe.
+- **Why:** (a) is a current Chromium (155) built for Ubuntu 24.04 on arm64 and amd64, updates through apt, and was tested here: the sandbox works and `ccu certs` CAs are trusted. Without built-in names, `ccu install chromium` failed ("no installation candidate") and `ccu install firefox` pulled in snapd. The cost is trusting a third-party PPA, limited by the pin.
+- **Review:** If the PPA should not be trusted by default, change the `chromium` case in `rootfs/usr/local/bin/ccu-install` to print the recipe instead. If the PPA stops publishing for noble/arm64, fall back to (b).
+
+## H2. AppImages are unpacked at install time
+
+- **Date:** 2026-10-22
+- **Decision:** `ccu install` unpacks an AppImage's squashfs with `unsquashfs` into `/opt/appimages/<cmd>` and the command runs `AppRun`. The old `APPIMAGE_EXTRACT_AND_RUN=1` wrapper remains as the fallback when unpacking fails.
+- **Options:** (a) unpack once with unsquashfs; (b) keep extract-and-run and add `libz.so` (zlib1g-dev or a symlink) for runtimes that link it; (c) `--appimage-extract` at install time, which runs the AppImage's own runtime.
+- **Why:** The Obsidian arm64 AppImage (electron-builder) didn't start with the old extract-and-run wrapper: its runtime needs `libz.so`, which Ubuntu only ships in zlib1g-dev. (a) also doesn't execute the downloaded runtime, starts instantly instead of unpacking 350 MB on every launch, and worked for Obsidian (arm64, GUI), Neovim (arm64, new static runtime) and DB Browser for SQLite (x86_64, on the x86 target). (c) has the same runtime problem as (b). The cost is disk space: the unpacked copy sits next to the original file in `~/apps`.
+- **Review:** `squashfs-tools` is in the image now; older containers get it from apt on first use.
+
+## H3. Bake certutil (libnss3-tools) into the image
+
+- **Date:** 2026-10-22
+- **Decision:** The image installs `libnss3-tools`, so `ccu certs` always fills `~/.pki/nssdb`, and `ccu-install` runs a new `netsetup browsers` step after installing a browser.
+- **Options:** (a) bake it in (about 7 MB); (b) keep telling users to `ccu install libnss3-tools && ccu certs apply`; (c) have netsetup install it on demand.
+- **Why:** Chromium ignores the system store (tested: CA in `/etc/ssl/certs` only gives `ERR_CERT_AUTHORITY_INVALID`), so without certutil the order of "add CA" and "install browser" decided whether Chrome worked. (c) would make `ccu up` run apt, which fails offline or in egress mode.
+- **Review:** None needed beyond the image size.
+
+## H4. `VNC_PASSWORD` stays an environment variable; the password file moves to tmpfs
+
+- **Date:** 2026-10-22
+- **Decision:** Fix the root-owned password file that locked everyone out of the viewer by writing it to `/dev/shm` owned by the desktop user. Keep passing the password as a container env variable, but by name (not on the `podman run` command line), unset it before supervisord, and drop it from the environment `cu` gives to launched apps.
+- **Options:** (a) env variable, reduced exposure; (b) a Podman secret mounted as a file, so `podman inspect` shows only its name; (c) `podman create`, copy the file in, then `podman start`.
+- **Why:** Whoever can run `podman inspect` can also `podman exec` into the container and read the file, so (b) and (c) hide little, and (b) adds secret lifecycle to `up`/`rm`/`reset`. Worse, with (b) a snapshot or image whose entrypoint predates it would silently start without a password. Snapshots were the real leak: the old `/etc/ccu-vncpass` was committed into them; tmpfs is not.
+- **Review:** README "Notes and limits" states what the password protects against.
+
+## H5. `ccu shell` without a terminal reads commands from stdin
+
+- **Date:** 2026-10-22
+- **Decision:** When stdin isn't a TTY, `ccu shell` runs `podman exec -i` (no `-t`).
+- **Options:** (a) drop `-t` without a TTY; (b) refuse with an error pointing to `ccu exec`; (c) leave it.
+- **Why:** (c) hung forever with stdin at EOF and left an orphaned bash in the container. (a) makes `ccu shell < script.sh` useful and is what users expect from `bash`.
+- **Review:** None.

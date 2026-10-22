@@ -18,7 +18,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     SCREEN_HEIGHT=800 \
     SCREEN_DEPTH=24
 
-# Desktop, VNC/noVNC, input/screenshot tools.
+# Desktop, VNC/noVNC, input/screenshot tools. squashfs-tools unpacks AppImages
+# for ccu-install; libnss3-tools (certutil) puts `ccu certs` CAs into the NSS
+# store that Chrome, Chromium and Electron apps read.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         sudo ca-certificates curl wget gnupg less nano vim-tiny file \
         unzip xz-utils bzip2 p7zip-full procps psmisc iproute2 \
@@ -27,7 +29,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xfce4 xfce4-terminal mousepad ristretto \
         xdotool wmctrl scrot xclip \
         python3 python3-venv python3-pil \
-        libfuse2t64 desktop-file-utils xdg-utils \
+        libfuse2t64 squashfs-tools desktop-file-utils xdg-utils \
+        libnss3-tools \
         fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 

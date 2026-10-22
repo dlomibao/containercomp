@@ -37,6 +37,7 @@ class CuError(Exception):
 
 def _env():
     env = dict(os.environ, DISPLAY=DISPLAY)
+    env.pop("VNC_PASSWORD", None)  # podman exec passes it; launched apps don't need it
     try:
         with open(SESSION_ENV) as f:
             for line in f:

@@ -98,10 +98,23 @@ $ ccu find "search for" --role text --json      # one element as JSON
 |---|---|
 | `gimp inkscape` | `apt-get install` (lists are refreshed if stale) |
 | `~/Downloads/foo.deb` | copied in, `apt-get install ./foo.deb` |
-| `~/Downloads/Foo-1.2.AppImage` | copied in, wrapped as `/usr/local/bin/foo` (runs with `APPIMAGE_EXTRACT_AND_RUN=1`, so no FUSE is needed) |
+| `firefox` `chromium` `google-chrome` | real browser debs instead of Ubuntu's snap stubs (see [Browsers](#browsers)) |
+| `~/Downloads/Foo-1.2-arm64.AppImage` | copied in, unpacked to `/opt/appimages/foo/` and run as the command `foo` (version and platform words are dropped from the name). Running an AppImage directly needs FUSE, which a container doesn't have. If it can't be unpacked, the command runs it with `APPIMAGE_EXTRACT_AND_RUN=1` instead |
 | `setup.exe` / `setup.msi` | x86 target only: starts the installer under Wine on the desktop, for Claude (or you) to click through |
-| `.tar.gz` `.zip` `.7z` ... | extracted to `~/apps/<name>/` |
+| `.tar.gz` `.zip` `.7z` ... | extracted to `~/apps/<name>/` (a single top-level folder is unwrapped); the executables found are listed |
 | `https://...` | downloaded inside the container, then handled as above |
+
+### Browsers
+
+Ubuntu's `firefox` and `chromium` packages only install snaps, which don't run in a container, and Google ships no Linux arm64 build of Chrome. `ccu install` knows these names and uses a deb source instead, checking each repository's signing key against its published fingerprint:
+
+| Name | Source | Targets |
+|---|---|---|
+| `firefox` | Mozilla's apt repository (`packages.mozilla.org`) | native and x86 |
+| `chromium` | the [xtradeb PPA](https://launchpad.net/~xtradeb/+archive/ubuntu/apps), which builds Chromium debs for Ubuntu. It's a third-party archive, pinned so that only Chromium comes from it | native and x86 (recommended on arm64) |
+| `google-chrome` | Google's apt repository | x86 only |
+
+Tested on 2026-10-22: Chromium 155 (arm64) and Chrome 156 (x86 target, Rosetta) run without `--no-sandbox` (Chromium's `chrome://sandbox` page reports the namespace sandbox as active), and both trust CAs added with `ccu certs`, whether those were added before or after the browser. Firefox 158 (arm64) trusts them through the enterprise policy.
 
 ### Settings
 
@@ -112,7 +125,7 @@ $ ccu find "search for" --role text --json      # one element as JSON
 | `CCU_SCREEN` | `1280x800` | screen size, applied when the container is created |
 | `CCU_PORT` | `6080` / `6081`, or the next free port | host port for noVNC (always bound to 127.0.0.1), applied when the container is created |
 | `CCU_IMAGE` | the desktop's base image, else `localhost/containercomp:<target>` | base image; snapshots are named `<image>-snap-NAME` |
-| `VNC_PASSWORD` | *(none)* | require a password in the viewer |
+| `VNC_PASSWORD` | *(none)* | require a password in the viewer (VNC authentication uses only the first 8 characters) |
 | `CCU_SHOT_DIR` | `$TMPDIR/ccu` | where screenshots are saved |
 | `CCU_EGRESS` | *(none)* | allowlist file or `offline`, same as `ccu up --egress` (see [Restricting network access](#restricting-network-access)) |
 | `CCU_EGRESS_IMAGE` | `localhost/containercomp-egress:latest` | image for the egress proxy, built from `egress/` |
@@ -245,7 +258,7 @@ Things to know:
 - A snapshot holds the container's filesystem only: installed packages, files, app settings. It doesn't hold running processes, so apps that were open at save time aren't running after a restore. Volumes and bind mounts aren't included.
 - On every boot, `/opt/ccu/bin/clean-runtime` deletes the stale X lock, sockets, D-Bus and session files that a snapshot of a live desktop carries, so a restored container boots like a fresh one. Pausing makes the snapshot a single point in time, but an app that was in the middle of saving can still leave a half-written file. Close or save apps before you snapshot when that matters.
 - Snapshots share the base image's layers, so each one only costs the space of its changes. A snapshot depends on its base image, though: rebuilding the base doesn't update existing snapshots.
-- `VNC_PASSWORD` is cleared from a snapshot's environment. Everything else in the container, including files under `~`, ends up in exported archives, so don't export snapshots that contain secrets.
+- `VNC_PASSWORD` is cleared from a snapshot's environment, and its password file lives in `/dev/shm`, which isn't committed. Everything else in the container, including files under `~`, ends up in exported archives, so don't export snapshots that contain secrets.
 
 ## Test runs
 
@@ -376,8 +389,8 @@ ccu up                  # new containers get them; a running one is updated righ
   | curl, wget, apt, Python `ssl`/urllib (and, untested, git, Wine and Java via ca-certificates-java) | system store (`update-ca-certificates`) |
   | Python requests/httpx/pip (certifi) | `REQUESTS_CA_BUNDLE`, `SSL_CERT_FILE`, `PIP_CERT` point at the system bundle |
   | Node.js (incl. nodejs.org/nvm builds) | `NODE_EXTRA_CA_CERTS` points at the system bundle |
-  | Firefox (deb or tarball) | enterprise policy `/etc/firefox/policies/policies.json` |
-  | Chrome, Chromium, Electron | `~/.pki/nssdb`, which needs certutil: `ccu install libnss3-tools && ccu certs apply` (also after installing a browser later) |
+  | Firefox (deb or tarball) | enterprise policy `/etc/firefox/policies/policies.json` (tested with Mozilla's deb) |
+  | Chrome, Chromium, Electron | the user's NSS db `~/.pki/nssdb`, filled with certutil (in the image). Chromium ignores the system store. Images built before certutil was added need `ccu install libnss3-tools && ccu certs apply` |
 
   The env variables are set in the image, so containers from images built before this feature need `ccu build` and a new container (`ccu rm && ccu up`) for the Python certifi and Node cases; the system store, Firefox and NSS work on older containers too. Tools with their own pinned bundle (some Java apps with a private keystore, a few Electron apps) may still need their own configuration.
 
@@ -392,8 +405,8 @@ ccu certs sync --machine   # or: ccu certs apply --machine
 It installs the same CAs as `/etc/pki/ca-trust/source/anchors/containercomp.pem` in the VM and runs `update-ca-trust`. It changes the VM that every Podman container on your Mac shares, which is why it never happens implicitly. If pulls still fail, restart the VM (this stops all containers): `podman machine stop && podman machine start`.
 ## Notes and limits
 
-- **Snaps don't work in containers.** That includes Ubuntu's `firefox` and `chromium` apt packages. Use vendor repos, tarballs or AppImages instead.
-- **Electron and Chromium apps** usually need `--no-sandbox` in a container.
+- **Snaps don't work in containers.** That includes Ubuntu's `firefox` and `chromium` apt packages; `ccu install firefox` or `chromium` installs debs instead (see [Browsers](#browsers)). For other snap-only apps, use vendor repos, tarballs or AppImages.
+- **Sandboxes:** user namespaces work in the container, so Chromium and Chrome run with their sandbox. Some Electron apps still pass `--no-sandbox` themselves (Obsidian's AppImage does); add it only if an app exits complaining about its sandbox.
 - **x86 on Apple Silicon** runs through Rosetta (see Requirements). It's fine for installers and everyday apps, though slower than native.
 - **Wine** is the Ubuntu 24.04 package (Wine 9.0) plus `winetricks`, with the Wine prefix already set up in the image.
   - **64-bit Windows programs work on Apple Silicon.** Tested with the 7-Zip x64 `.msi`: it installs through the GUI and the installed app runs.
@@ -401,6 +414,8 @@ It installs the same CAs as `/etc/pki/ca-trust/source/anchors/containercomp.pem`
   - App compatibility varies; check [WineHQ AppDB](https://appdb.winehq.org/).
 - **No GPU.** Rendering is software-only (llvmpipe).
 - **Security:** the viewer listens only on `127.0.0.1` and has no password by default. The container runs rootless under Podman, so root inside it is not root on your Mac.
+- **`VNC_PASSWORD`** keeps other local users and web pages on your Mac out of the viewer, not the agent: it's in the container's configuration, so `podman inspect` and a plain `podman exec` (or `ccu shell`) can read it. The desktop session, `ccu exec`, and apps started from the desktop or with `ccu launch` don't get it, and it isn't put on the `podman run` command line.
+- **`ccu shell`** opens an interactive shell. It's logged as one `shell` event; what you type in it isn't. Without a terminal (for example `ccu shell < script.sh`), it reads commands from stdin and exits at the end.
 
 ## Layout
 
