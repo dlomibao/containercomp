@@ -1,0 +1,226 @@
+#!/usr/bin/python3
+"""netsetup: corporate-network settings inside the container. Runs as root.
+
+  netsetup certs   read extra CA certificates (PEM) on stdin and trust them
+                   everywhere below; empty input removes the ones added before
+  netsetup proxy   point apt (and sudo) at the proxy from the container env
+  netsetup apply   both; `ccu up` runs this
+
+Trust stores covered by `certs`:
+  - the system store (update-ca-certificates): curl, wget, apt, Python ssl,
+    and what reads it: git, Wine, Java (ca-certificates-java). REQUESTS_CA_BUNDLE, SSL_CERT_FILE,
+    PIP_CERT and NODE_EXTRA_CA_CERTS point at it (set in the Containerfile).
+  - Firefox: enterprise policy in /etc/firefox/policies/policies.json
+  - Chrome, Chromium and Electron apps: the user's NSS db ~/.pki/nssdb
+    (needs certutil, from libnss3-tools)
+Certificates Ubuntu already trusts are skipped.
+"""
+import base64
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+USER = "user"
+CA_DIR = "/usr/local/share/ca-certificates/ccu"
+DISTRO_CA_DIR = "/usr/share/ca-certificates"
+FIREFOX_POLICY = "/etc/firefox/policies/policies.json"
+NSSDB = f"/home/{USER}/.pki/nssdb"
+APT_PROXY = "/etc/apt/apt.conf.d/95ccu-proxy"
+SUDO_ENV = "/etc/sudoers.d/91-ccu-env"
+CHROMIUM_BROWSERS = ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+                     "microsoft-edge", "brave-browser", "vivaldi")
+PEM_RE = re.compile(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", re.S)
+
+
+def ders(text):
+    out = []
+    for m in PEM_RE.finditer(text):
+        try:
+            out.append(base64.b64decode("".join(m.group(1).split()), validate=True))
+        except ValueError:
+            print("netsetup: skipping a malformed certificate", file=sys.stderr)
+    return out
+
+
+def to_pem(der):
+    b = base64.b64encode(der).decode()
+    body = "\n".join(b[i:i + 64] for i in range(0, len(b), 64))
+    return f"-----BEGIN CERTIFICATE-----\n{body}\n-----END CERTIFICATE-----\n"
+
+
+def subject(pem):
+    """The certificate's subject, or None if openssl can't parse it."""
+    r = subprocess.run(["openssl", "x509", "-noout", "-subject", "-nameopt", "oneline"],
+                       input=pem, capture_output=True, text=True)
+    return r.stdout.strip().removeprefix("subject=").strip() if r.returncode == 0 else None
+
+
+def read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def write(path, text, mode=0o644):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write(text)
+    os.chmod(path, mode)
+
+
+def as_user(*cmd):
+    return subprocess.run(["runuser", "-u", USER, "--", *cmd], capture_output=True, text=True)
+
+
+def certs(data):
+    distro = set()
+    for path in glob.glob(DISTRO_CA_DIR + "/**/*.crt", recursive=True):
+        distro.update(hashlib.sha256(d).hexdigest() for d in ders(read(path) or ""))
+
+    wanted, names, known = {}, {}, 0
+    for der in ders(data):
+        fp = hashlib.sha256(der).hexdigest()
+        name = f"ccu-{fp[:16]}.crt"
+        if name in wanted:
+            continue
+        pem = to_pem(der)
+        subj = subject(pem)
+        if subj is None:
+            print("netsetup: skipping a certificate openssl can't parse", file=sys.stderr)
+        elif fp in distro:
+            known += 1
+        else:
+            wanted[name], names[name] = pem, subj
+
+    if known:
+        print(f"skipped {known} certificate(s) Ubuntu already trusts")
+    existing = {}
+    if os.path.isdir(CA_DIR):
+        existing = {n: read(os.path.join(CA_DIR, n)) for n in os.listdir(CA_DIR)}
+    if existing != wanted:
+        for n in existing:
+            if n not in wanted:
+                os.remove(os.path.join(CA_DIR, n))
+        for n, pem in wanted.items():
+            write(os.path.join(CA_DIR, n), pem)
+        if not wanted and os.path.isdir(CA_DIR):
+            os.rmdir(CA_DIR)
+        # --fresh also drops links for removed certs; hooks update Java's store.
+        subprocess.run(["update-ca-certificates", "--fresh"], check=True,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"trusting {len(wanted)} extra CA certificate(s) in the container" + (":" if wanted else ""))
+        for n in sorted(names):
+            print(f"  {names[n]}")
+
+    paths = sorted(os.path.join(CA_DIR, n) for n in wanted)
+    firefox_policy(paths)
+    nssdb(paths)
+
+
+def firefox_policy(paths):
+    # Applies to every Firefox build (deb or tarball), including ones installed later.
+    text = read(FIREFOX_POLICY)
+    if text is None and not paths:
+        return
+    try:
+        policy = json.loads(text) if text else {}
+    except ValueError:
+        print(f"netsetup: {FIREFOX_POLICY} is not valid JSON; Firefox not updated", file=sys.stderr)
+        return
+    pol = policy.setdefault("policies", {})
+    cert_pol = pol.setdefault("Certificates", {})
+    install = [p for p in cert_pol.get("Install", []) if not p.startswith(CA_DIR + "/")] + paths
+    if install:
+        cert_pol["Install"] = install
+    else:
+        cert_pol.pop("Install", None)
+    if not cert_pol:
+        pol.pop("Certificates")
+    if policy == {"policies": {}}:
+        if text is not None:
+            os.remove(FIREFOX_POLICY)
+    else:
+        write(FIREFOX_POLICY, json.dumps(policy, indent=2) + "\n")
+
+
+def nssdb(paths):
+    # Chromium-based browsers trust their own root list plus this per-user db.
+    if not shutil.which("certutil"):
+        if paths and (os.path.isdir(NSSDB) or any(shutil.which(b) for b in CHROMIUM_BROWSERS)):
+            print("note: Chrome/Chromium need certutil to see these CAs: "
+                  "ccu install libnss3-tools && ccu certs apply")
+        return
+    if not paths and not os.path.isdir(NSSDB):
+        return
+    db = f"sql:{NSSDB}"
+    if not os.path.exists(os.path.join(NSSDB, "cert9.db")):
+        as_user("mkdir", "-p", NSSDB)
+        as_user("certutil", "-N", "-d", db, "--empty-password")
+    listing = as_user("certutil", "-L", "-d", db).stdout.splitlines()
+    for line in listing:
+        nick = line.rsplit(None, 1)[0].strip() if line.strip() else ""
+        if nick.startswith("ccu-"):
+            as_user("certutil", "-D", "-d", db, "-n", nick)
+    for p in paths:
+        nick = os.path.basename(p)[:-4]
+        r = as_user("certutil", "-A", "-d", db, "-t", "C,,", "-n", nick, "-i", p)
+        if r.returncode != 0:
+            print(f"netsetup: certutil could not add {p}: {r.stderr.strip()}", file=sys.stderr)
+
+
+def proxy():
+    env = lambda k: os.environ.get(k) or os.environ.get(k.upper()) or ""
+    http, https, no = env("http_proxy"), env("https_proxy"), env("no_proxy")
+    lines = []
+    if http:
+        lines.append(f'Acquire::http::Proxy "{http}";')
+    if https:
+        lines.append(f'Acquire::https::Proxy "{https}";')
+    if lines:
+        # apt ignores no_proxy once a proxy is configured; exempt plain host names.
+        for host in (h.strip() for h in no.split(",")):
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host) and not re.fullmatch(r"[0-9.]+", host):
+                for scheme in ("http", "https"):
+                    lines.append(f'Acquire::{scheme}::Proxy::{host} "DIRECT";')
+        write(APT_PROXY, "// written by ccu (netsetup) from the container's proxy env\n" + "\n".join(lines) + "\n")
+    elif os.path.exists(APT_PROXY):
+        os.remove(APT_PROXY)
+
+    # Keep proxy and CA variables for `sudo apt`, `sudo pip` and friends.
+    rules = ('Defaults env_keep += "http_proxy https_proxy no_proxy all_proxy '
+             'HTTP_PROXY HTTPS_PROXY NO_PROXY ALL_PROXY"\n'
+             'Defaults env_keep += "REQUESTS_CA_BUNDLE SSL_CERT_FILE PIP_CERT NODE_EXTRA_CA_CERTS"\n')
+    if read(SUDO_ENV) != rules:
+        with tempfile.NamedTemporaryFile("w", dir="/etc/sudoers.d", prefix=".ccu", delete=False) as f:
+            f.write(rules)
+        os.chmod(f.name, 0o440)
+        if subprocess.run(["visudo", "-cqf", f.name], capture_output=True).returncode == 0:
+            os.replace(f.name, SUDO_ENV)
+        else:
+            os.remove(f.name)
+            print("netsetup: sudoers rule rejected by visudo; skipped", file=sys.stderr)
+
+
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    if cmd not in ("certs", "proxy", "apply"):
+        print(__doc__.strip(), file=sys.stderr)
+        sys.exit(2)
+    if os.geteuid() != 0:
+        sys.exit("netsetup: run as root")
+    if cmd in ("certs", "apply"):
+        certs(sys.stdin.read())
+    if cmd in ("proxy", "apply"):
+        proxy()
+
+
+if __name__ == "__main__":
+    main()
