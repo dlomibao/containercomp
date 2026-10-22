@@ -60,6 +60,7 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             focus TITLE   wait_window TITLE [--timeout S]   wait S
             (append --shot to any screen command to screenshot afterwards)
 Clipboard   clip get | set TEXT|- | paste TEXT|- | push | pull | targets   [--primary] [--type image/png]
+Secrets     secret type KEY | env KEY VAR -- CMD | list | set KEY | rm KEY   (macOS Keychain, ccu-secret.KEY)
 Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
 Network     up --egress FILE | up --offline   egress [status] | egress log [-f] [--all] | egress set FILE|offline
 ```
@@ -146,6 +147,29 @@ ccu clip get --type image/png > shot.png      # images: ccu clip set --type imag
 - Text is always sent over stdin, never on a command line, so it doesn't show up in process listings; there's no size limit beyond memory. `pull` writes the desktop's clipboard through a private temp file and leaves the Mac clipboard alone if reading it fails.
 - Clipboard reads and writes are logged like `type`: only the length by default (`CCU_AUDIT_TYPE`). They don't take audit screenshots, since the screen doesn't change; with `paste`, the ctrl+v is logged as its own `key` entry with a screenshot.
 - MCP: `clipboard_get` returns the text (or the image), and `clipboard_set` takes `text`, plus `paste: true` to press ctrl+v (or `paste_key`) right away.
+
+## Secrets
+
+To log an agent into a test account inside the desktop without the password passing through the agent, store it in the macOS login Keychain once and let `ccu` type it:
+
+```bash
+ccu secret set staging-login        # you: prompts twice, without echo (or pipe one line in)
+ccu secret list                     # key names only
+ccu secret type staging-login       # the agent: types it into the focused field
+ccu secret env gh-token GH_TOKEN -- gh auth status   # a CLI tool in the container gets it as $GH_TOKEN
+ccu secret rm staging-login
+```
+
+`ccu` only uses generic-password items whose service is `ccu-secret.<KEY>` and whose account is your macOS user. That's the same layout as the `claude-secret.<key>` convention, with its own prefix, so a secret is typed into the desktop only if someone stored it for that purpose. To reuse an existing item, store it again under the `ccu-secret.` name. `ccu secret set` is equivalent to `security add-generic-password -U -a "$USER" -s ccu-secret.KEY -w` with the value fed on stdin.
+
+**How the value travels.** `security find-generic-password` writes it into a pipe, `podman exec -i` carries the pipe into the container, and `cu` hands it to `xdotool type --file -` on stdin. It's never a command-line argument (on the Mac or in the container), never held in a shell variable or a file, and never put on the clipboard. The audit log records only `{"key":…,"len":…}`, whatever `CCU_AUDIT_TYPE` says, and no audit screenshot is taken after a secret is typed. `secret env` runs the command with the variable set and stdin closed, and replaces the exact value with `[secret KEY]` in the command's output and in the logged output tail. There's no MCP tool for this: the MCP server runs inside the container and can't reach the Keychain, and a path that lets container code ask the host for secrets is exactly what this design avoids. Agents that use MCP for everything else use `ccu secret type` from the shell.
+
+**Threat model.** This keeps secrets out of places where they leak by accident: the agent's context and transcript, the audit log and its host mirror, shell history, process listings, files on either side, and (when the field masks its input) screenshots. In testing, a random value typed into a `read -s` prompt and used through `secret env` didn't show up in host or container `ps` samples taken during typing, the audit log, the host mirror, `podman events`, the command's output, or anywhere in the container's filesystem afterwards. It does **not** protect against:
+
+- **Anything inside the container.** The app that receives the keystrokes gets the secret, by design. Any other X client on the display can watch keystrokes, root can read process memory, and `secret env` values are visible in `/proc/<pid>/environ`. Use test accounts, not real ones.
+- **The wrong field.** `ccu` can't tell what has focus. If the agent types a secret into a search box, chat field or URL bar, it ends up wherever that goes, and in later screenshots. Check that a password field has focus first.
+- **Unmasked fields and echoing apps.** A field that shows its text (or a "show password" toggle) puts the value in the next screenshot, which the agent sees and the audit log keeps. `secret env` masks only the exact value, not encoded forms (base64, URL-encoding) or partial echoes.
+- **The agent on the Mac.** An agent that can run arbitrary shell commands as you can call `security find-generic-password` itself; items created with the `security` command can be read that way without a prompt. The `ccu-secret.` prefix records what you approved for the desktop; it isn't an access control. The length of each typed secret is logged.
 
 ## Audit and recording
 

@@ -318,6 +318,125 @@ def wait_for_window(pattern, timeout=30.0):
     raise CuError(f"timed out after {timeout:g}s waiting for window matching {pattern!r}")
 
 
+# --- secrets -------------------------------------------------------------------
+# `ccu secret` on the host reads a Keychain item and pipes it to `cu secret` on
+# stdin. The value never goes on a command line, into the audit log (only its
+# key and length), into a file, or onto the clipboard.
+
+def type_secret(name, secret, delay_ms=12):
+    """Type `secret` into the focused window. Logged as key name and length only,
+    whatever CCU_AUDIT_TYPE says, and without an audit screenshot."""
+    if not secret:
+        raise CuError(f"secret {name!r} is empty")
+    if "\n" in secret or "\r" in secret:
+        raise CuError(f"secret {name!r} contains a line break, which would press Return; not typing it")
+    with audit.event("secret_type", {"key": name, "len": len(secret)}, kind="action", shot=False):
+        # --file - reads the text from stdin, so it isn't in xdotool's argv.
+        proc = subprocess.run(["xdotool", "type", "--delay", str(delay_ms), "--file", "-"],
+                              input=secret.encode(), env=_env(), capture_output=True)
+        if proc.returncode != 0:
+            raise CuError(f"xdotool type failed ({proc.returncode})")
+
+
+def _scrub(src, dst, secret, mark, tails, key):
+    # Copy src to dst with every occurrence of secret replaced by mark. Keeps
+    # len(secret)-1 bytes back so a value split across reads is still caught.
+    keep, carry, tail = len(secret) - 1, b"", b""
+    for chunk in iter(lambda: src.read1(65536), b""):
+        buf = (carry + chunk).replace(secret, mark)
+        cut = max(0, len(buf) - keep)
+        out, carry = buf[:cut], buf[cut:]
+        dst.write(out)
+        dst.flush()
+        tail = (tail + out)[-audit.TAIL_CHARS:]
+    dst.write(carry)
+    dst.flush()
+    tails[key] = (tail + carry)[-audit.TAIL_CHARS:].decode(errors="replace")
+
+
+def secret_env(name, var, secret, argv):
+    """Run argv with the secret in environment variable `var` and stdin closed.
+    The value is replaced by "[secret NAME]" in its output and in the log."""
+    import threading
+
+    if not secret:
+        raise CuError(f"secret {name!r} is empty")
+    env = dict(_env(), **{var: secret})
+    mark, raw = f"[secret {name}]".encode(), secret.encode()
+    with audit.event("secret_env", {"key": name, "var": var, "len": len(secret), "argv": list(argv)},
+                     shot=False) as ev:
+        try:
+            proc = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError as e:
+            raise CuError(f"cannot run {argv[0]}: {e.strerror}")
+        tails = {}
+        threads = [threading.Thread(target=_scrub, args=(proc.stdout, sys.stdout.buffer, raw, mark, tails, "stdout")),
+                   threading.Thread(target=_scrub, args=(proc.stderr, sys.stderr.buffer, raw, mark, tails, "stderr"))]
+        for t in threads:
+            t.start()
+        rc = proc.wait()
+        for t in threads:
+            t.join()
+        ev.update(ok=rc == 0, result={"exit": rc, **tails})
+    return rc
+
+
+def _keychain_value(data):
+    # `security find-generic-password -g` prints the value on stderr as
+    # `password: "TEXT"` for printable ASCII and `password: 0xHEX  "..."` for
+    # anything else (where -w would print bare hex, indistinguishable from text).
+    for line in data.split(b"\n"):
+        if line.startswith(b"password: "):
+            v = line[len(b"password: "):]
+            if v.startswith(b"0x"):
+                try:
+                    return bytes.fromhex(v[2:].split(b" ", 1)[0].decode())
+                except ValueError:
+                    break
+            if len(v) >= 2 and v[:1] == v[-1:] == b'"':
+                return v[1:-1]
+            break
+    raise CuError("could not read the value from the Keychain output")
+
+
+def _secret_main(argv):
+    """cu secret [--keychain] type KEY | cu secret [--keychain] env KEY VAR -- CMD...
+    The value comes on stdin: raw (one trailing newline is dropped) or, with
+    --keychain, as the stderr of `security find-generic-password -g`."""
+    usage = "usage: cu secret [--keychain] type KEY | env KEY VAR -- CMD...  (the value on stdin)"
+    keychain = bool(argv) and argv[0] == "--keychain"
+    if keychain:
+        argv = argv[1:]
+    if len(argv) < 2 or argv[0] not in ("type", "env"):
+        print(usage, file=sys.stderr)
+        return 2
+    if sys.stdin.isatty():
+        print("cu: secret reads the value from stdin; use ccu secret on the host", file=sys.stderr)
+        return 2
+    data = sys.stdin.buffer.read()
+    try:
+        if keychain:
+            data = _keychain_value(data)
+        elif data.endswith(b"\n"):
+            data = data[:-1]
+        try:
+            secret = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise CuError("the secret is not UTF-8 text")
+        if argv[0] == "type":
+            if len(argv) != 2:
+                raise CuError(usage)
+            type_secret(argv[1], secret)
+            return 0
+        if len(argv) < 5 or argv[3] != "--" or not argv[2].isidentifier():
+            raise CuError(usage)
+        return secret_env(argv[1], argv[2], secret, argv[4:])
+    except CuError as e:
+        print(f"cu: {e}", file=sys.stderr)
+        return 1
+
+
 # Let the audit log read the active window and reach the display.
 audit.window_title, audit.x_env, audit.screen_size = active_window, _env, screen_size
 
@@ -364,6 +483,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if argv and argv[0] in ("exec", "record", "audit"):
         return audit.main(argv)  # see ccu_audit.py
+    if argv and argv[0] == "secret":
+        return _secret_main(argv[1:])
     p = argparse.ArgumentParser(prog="cu", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
 

@@ -103,3 +103,35 @@ IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's l
 - **Options:** (a) log clipboard text in full; (b) reuse the `type` redaction setting; (c) never log it, not even a hash.
 - **Why:** The clipboard regularly carries the same things `type` does (and sometimes more: tokens copied out of apps), so it should follow the same user-chosen setting. Setting or reading the clipboard doesn't change the screen, so a screenshot would only cost disk and context.
 - **Review:** `ccu audit tail` after a `clip set` shows `{"redacted":"length",...}`. Fallback: add a separate `CCU_AUDIT_CLIP` setting if someone wants the two to differ.
+
+## E4. Secrets come only from Keychain items named `ccu-secret.<KEY>`
+
+- **Date:** 2026-10-22
+- **Decision:** `ccu secret` reads, lists and writes only login-Keychain generic passwords with service `ccu-secret.<KEY>` and account `$USER`, the same layout as the maintainer's `claude-secret.<key>` convention but with its own prefix. Key names are letters, digits, `.`, `_`, `-`.
+- **Options:** (a) reuse `claude-secret.*`; (b) own prefix `ccu-secret.*`; (c) both; (d) a separate allowlist file naming permitted `claude-secret` keys.
+- **Why:** `claude-secret.*` items are for Claude to use on the host (API tokens and so on); typing one into a GUI app in a container is a different decision. A separate prefix makes that decision per item and visible in Keychain Access, and `ccu secret list` can't reveal what else is stored. (d) adds a file to keep in sync for no extra protection. This is a convention, not enforcement: an agent with a host shell can run `security` itself.
+- **Review:** Read the README "Secrets" threat model. Possible hardening, untested: create items whose access list doesn't trust `security`, so macOS asks before each use.
+
+## E5. Secrets are typed with `xdotool type --file -`, logged as key and length, without an audit screenshot
+
+- **Date:** 2026-10-22
+- **Decision:** `ccu secret type KEY` pipes `security find-generic-password -g` output into `podman exec -i … cu secret --keychain type KEY`, which parses it and feeds the value to `xdotool type --file -` on stdin. The audit entry is `secret_type {"key", "len"}` with no screenshot, regardless of `CCU_AUDIT_TYPE`. Values with line breaks are refused (they would press Return). `--shot` still works because the agent has to see the result.
+- **Options:** delivery: (a) xdotool from stdin; (b) set the clipboard and paste; (c) xdotool with the value as an argument. Screenshot: (a) take it as usual; (b) skip it; (c) blur the whole screenshot.
+- **Why:** Delivery (b) leaves the secret on the clipboard, where `clip get` or any app can read it later; (c) puts it in `/proc/*/cmdline`. Skipping the screenshot avoids one more stored copy of a possibly unmasked field; blurring would also hide what happened, and ccu doesn't know where the field is. `-g` is used because `-w` prints non-ASCII values as bare hex, which can't be told apart from a hex password; tested with ASCII values containing quotes and backslashes and with non-ASCII ones.
+- **Review:** Check `ccu audit tail` after a `secret type`. If an app rejects synthetic typing, a paste-then-clear-clipboard mode could be added later.
+
+## E6. No MCP tool for secrets
+
+- **Date:** 2026-10-22
+- **Decision:** Secrets are only available through the host CLI (`ccu secret type`, `ccu secret env`). The MCP server gets no secret tool.
+- **Options:** (a) no MCP tool; (b) an MCP tool in the container that asks the host for a secret; (c) a host-side wrapper around `ccu mcp` that intercepts a `type_secret` tool call and types the value itself.
+- **Why:** The MCP server runs inside the container. (b) needs a channel from the container to the host Keychain, which lets anything running in the container (including the apps under test) request secrets. (c) is safe in principle but means parsing JSON-RPC in bash, a lot of code to maintain for a convenience. Agents using MCP still have a shell for `ccu secret type`.
+- **Review:** If MCP-only clients need it, revisit (c), written in Python on the host.
+
+## E7. `ccu secret env` for CLI tools, with the value masked in output; `ccu secret set` reads the value without echo
+
+- **Date:** 2026-10-22
+- **Decision:** `ccu secret env KEY VAR -- CMD...` runs CMD in the container with VAR set and stdin closed; stdout and stderr are streamed with the exact value replaced by `[secret KEY]` (also in the audit log's output tail). `ccu secret set KEY` prompts twice with `read -s` (or reads one line from a pipe) and feeds the value to `security add-generic-password -w` on stdin; `ccu secret rm KEY` deletes it.
+- **Options:** for CLI tools: (a) env var; (b) pipe the secret to CMD's stdin; (c) nothing. For storing: (a) tell the user to run `security add-generic-password -w VALUE` (the value is briefly in `ps`); (b) a `set` command that keeps it off the command line.
+- **Why:** Most CLIs that take a token read it from an env variable, and `sh -c 'printf %s "$VAR" | tool --password-stdin'` covers the stdin case. Masking catches the common accident of a tool echoing its token. `security` reads the value from stdin when it isn't given on the command line, so `set` never puts it in `ps`.
+- **Review:** The interactive prompt path of `secret set` (a real terminal) was not tested unattended; the piped path was.
