@@ -36,6 +36,14 @@ IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's l
 - **Why:** (a) briefly makes the VM trust a CA whose private key sits in a temp directory. (b) has no such window, but only one machine can run at a time, so it has to wait until nothing else is running.
 - **Review:** The final summary says whether this happened.
 
+## D5. The CI and prebuilt-image work waits on a local branch until the token can push workflows
+
+- **Date:** 2026-10-22
+- **Decision:** The `gh` token on this Mac has the scopes `gist`, `read:org` and `repo` but not `workflow`, and GitHub rejects any push that adds a file under `.github/workflows/`. That includes pushing `main` once the CI work is merged. So the CI work (feature D) is merged into a local branch, `ci-prebuilt`, on top of everything else, and tested locally. `main` gets every other feature and is pushed as usual.
+- **Options:** (a) local `ci-prebuilt` branch, pushed after the maintainer grants the scope; (b) merge it into local `main` and stop pushing `main`; (c) merge everything except the workflow file; (d) push some other way, e.g. a different credential.
+- **Why:** (b) would hold up every other feature. (c) ships `ccu pull` with nothing ever published, so every first `up` would try GHCR and fail before building. (d) works around a permission the maintainer hasn't granted.
+- **Review:** Run `gh auth refresh -h github.com -s workflow`, then push `ci-prebuilt` to `main` (a fast-forward) and watch the first run. Fallback: merge only `.github/workflows/ci.yml` and the `ci/` scripts, leaving out pulling.
+
 ## C. Multiple desktops
 
 ## C1. A desktop remembers its target and base image; a conflicting `-t` is an error
