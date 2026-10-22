@@ -1,0 +1,11 @@
+#!/bin/sh
+# Egress proxy entrypoint: run squid in the foreground as PID 1, so
+# `podman kill -s HUP` makes it re-read /etc/squid/allowlist.txt.
+set -eu
+
+mkdir -p /run/squid /var/log/squid
+chown squid:squid /run/squid /var/log/squid
+touch /var/log/squid/access.log
+chown squid:squid /var/log/squid/access.log
+rm -f /run/squid/squid.pid
+exec squid -N -f /etc/squid/squid.conf

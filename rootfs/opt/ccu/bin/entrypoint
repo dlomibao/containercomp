@@ -21,6 +21,9 @@ if [ -n "${CCU_INSTANCE:-}" ] && [ "$(cat "$audit/.instance" 2>/dev/null)" != "$
     chown -R user:user "$audit"
 fi
 
+# Point sudo and apt at the egress proxy when ccu runs in --egress mode.
+/opt/ccu/bin/egress-env
+
 if [ -n "${VNC_PASSWORD:-}" ]; then
     x11vnc -storepasswd "$VNC_PASSWORD" /etc/ccu-vncpass >/dev/null
     export X11VNC_AUTH="-rfbauth /etc/ccu-vncpass"

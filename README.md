@@ -59,6 +59,7 @@ Screen      screenshot [FILE]   zoom X0 Y0 X1 Y1 [--scale N]
             focus TITLE   wait_window TITLE [--timeout S]   wait S
             (append --shot to any screen command to screenshot afterwards)
 Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop | status
+Network     up --egress FILE | up --offline   egress [status] | egress log [-f] [--all] | egress set FILE|offline
 ```
 
 `ccu screenshot` saves a PNG and prints its path, which Claude then reads. Screenshots are at native resolution (default 1280x800), so a pixel in the screenshot is the pixel you click.
@@ -85,6 +86,8 @@ Audit       audit tail [N] | verify | export [DIR]   record start [FILE] | stop 
 | `CCU_IMAGE` | `localhost/containercomp:<target>` | base image; snapshots are named `<image>-snap-NAME` |
 | `VNC_PASSWORD` | *(none)* | require a password in the viewer |
 | `CCU_SHOT_DIR` | `$TMPDIR/ccu` | where screenshots are saved |
+| `CCU_EGRESS` | *(none)* | allowlist file or `offline`, same as `ccu up --egress` (see [Restricting network access](#restricting-network-access)) |
+| `CCU_EGRESS_IMAGE` | `localhost/containercomp-egress:latest` | image for the egress proxy, built from `egress/` |
 
 Keep the screen around 1280x800 or smaller. Larger screenshots get downscaled before the model sees them, which hurts click accuracy.
 
@@ -170,6 +173,48 @@ Things to know:
 - Snapshots share the base image's layers, so each one only costs the space of its changes. A snapshot depends on its base image, though: rebuilding the base doesn't update existing snapshots.
 - `VNC_PASSWORD` is cleared from a snapshot's environment. Everything else in the container, including files under `~`, ends up in exported archives, so don't export snapshots that contain secrets.
 
+## Restricting network access
+
+By default the desktop has full internet access. For security testing, you can limit it to the app under test and its dependencies:
+
+```bash
+ccu up --egress allowlist.txt   # only these domains (HTTP/HTTPS through a proxy)
+ccu up --offline                # nothing at all
+ccu egress                      # mode and current allowlist
+ccu egress log                  # blocked requests (-f to follow, --all for allowed ones too)
+ccu egress set new-list.txt     # replace the list of a running filtered desktop (or `offline`)
+```
+
+The allowlist has one domain per line. `#` starts a comment, and case doesn't matter.
+
+```text
+# app under test
+staging.example.com        # exactly this host
+*.example-cdn.net          # example-cdn.net and every subdomain
+.example-api.com           # same as *.example-api.com
+host.containers.internal   # services on your Mac (e.g. localhost:3000)
+# apt mirrors (arm64 uses ports.ubuntu.com, amd64 archive/security.ubuntu.com)
+ports.ubuntu.com
+```
+
+Entries are host names only: no URLs, ports or paths. An allowlisted host is allowed on any port. IP addresses are matched literally, so `http://1.2.3.4/` only works if `1.2.3.4` is listed.
+
+**How it works.** The agent has passwordless root inside the desktop, so nothing inside that container can enforce a policy. Instead:
+
+- The desktop sits on its own `--internal` Podman network (`<name>-internal`, with DNS disabled). It has no route off that network, no resolver, and runs without `NET_ADMIN`/`NET_RAW`, so root can't add routes, addresses or raw sockets.
+- A separate squid container (`<name>-egress`) is attached to that network and to the default one. It's the only thing the desktop can reach, and it forwards a request only when the requested host matches the allowlist. HTTPS goes through `CONNECT`, so there's no TLS interception and no certificate to install.
+- `HTTP_PROXY`/`HTTPS_PROXY` point at it inside the desktop. They're also kept through `sudo`, and apt is configured to use them, so browsers, curl, apt and `ccu install` work for allowed hosts. Anything that ignores proxy settings (raw sockets, UDP, QUIC, SSH, `curl --noproxy`) fails. That's the intended default.
+- The noVNC viewer keeps working: Podman still publishes the port of a container on an internal network, inbound only.
+
+`ccu down` stops both containers. `ccu rm` removes the desktop, the proxy and the network. The mode is fixed when the desktop is created. To switch between unrestricted and filtered, run `ccu rm` and then `ccu up` with or without `--egress`. Within a filtered desktop you can change the list at any time with `ccu egress set` or `ccu up --egress FILE`.
+
+**What it doesn't cover:**
+
+- An allowed domain is fully trusted. If you allow a shared host (a CDN, cloud storage, `github.com`), the agent can send data to anything served from it, including through domain fronting. Keep entries as narrow as you can.
+- Filtering is by host name, not by URL or content. Allowed traffic isn't inspected.
+- DNS: the internal network has no resolver, and the proxy rejects off-list names before it looks anything up, so DNS can't be used to send data out. The proxy resolves only names on the allowlist. A wildcard entry covers any subdomain, so that domain's DNS servers can see whatever subdomain names are requested.
+- `ccu exec`, `cp-in`/`cp-out` and the viewer run from the host through Podman, not over the container's network, so the filter doesn't apply to them.
+
 ## Notes and limits
 
 - **Snaps don't work in containers.** That includes Ubuntu's `firefox` and `chromium` apt packages. Use vendor repos, tarballs or AppImages instead.
@@ -192,6 +237,7 @@ rootfs/opt/ccu/mcp_server.py  MCP server (FastMCP, stdio)
 rootfs/opt/ccu/ccu_audit.py   audit log, `cu exec`, screen recording
 rootfs/usr/local/bin/ccu-install   app installer (apt/deb/AppImage/Wine/archives)
 rootfs/etc/supervisor/conf.d/ccu.conf  Xvfb, XFCE, x11vnc, noVNC
+egress/                       egress proxy image (squid + config) for `ccu up --egress`
 skill/containercomp/SKILL.md  Claude Code skill
 install.sh                    links the CLI and skill; --mcp registers the MCP server
 ```

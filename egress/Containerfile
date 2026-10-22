@@ -1,0 +1,16 @@
+# containercomp egress proxy: a small squid that only forwards to allowlisted
+# domains. `ccu up --egress FILE` runs it next to the desktop, which sits on an
+# --internal network with no other way out.
+#
+#   podman build -t localhost/containercomp-egress:latest egress/
+FROM docker.io/library/alpine:3.22
+
+RUN apk add --no-cache squid \
+    && touch /etc/squid/allowlist.txt
+
+COPY squid.conf /etc/squid/squid.conf
+COPY entrypoint /usr/local/bin/ccu-egress
+RUN chmod 0755 /usr/local/bin/ccu-egress && chmod 0644 /etc/squid/squid.conf /etc/squid/allowlist.txt
+
+EXPOSE 3128
+ENTRYPOINT ["/usr/local/bin/ccu-egress"]
