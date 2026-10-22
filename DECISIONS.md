@@ -51,7 +51,7 @@ IDs: `Dn` are cross-cutting decisions. Per-feature decisions use the feature's l
 - **Date:** 2026-10-22
 - **Decision:** `ccu install` unpacks an AppImage's squashfs with `unsquashfs` into `/opt/appimages/<cmd>` and the command runs `AppRun`. The old `APPIMAGE_EXTRACT_AND_RUN=1` wrapper remains as the fallback when unpacking fails.
 - **Options:** (a) unpack once with unsquashfs; (b) keep extract-and-run and add `libz.so` (zlib1g-dev or a symlink) for runtimes that link it; (c) `--appimage-extract` at install time, which runs the AppImage's own runtime.
-- **Why:** The Obsidian arm64 AppImage (electron-builder) didn't start at all with (b)'s current form: its runtime needs `libz.so`. (a) also doesn't execute the downloaded runtime, starts instantly instead of unpacking 350 MB on every launch, and worked for Obsidian (arm64, GUI), Neovim (arm64, new static runtime) and DB Browser for SQLite (x86_64, on the x86 target). (c) has the same runtime problem as (b). The cost is disk space: the unpacked copy sits next to the original file in `~/apps`.
+- **Why:** The Obsidian arm64 AppImage (electron-builder) didn't start with the old extract-and-run wrapper: its runtime needs `libz.so`, which Ubuntu only ships in zlib1g-dev. (a) also doesn't execute the downloaded runtime, starts instantly instead of unpacking 350 MB on every launch, and worked for Obsidian (arm64, GUI), Neovim (arm64, new static runtime) and DB Browser for SQLite (x86_64, on the x86 target). (c) has the same runtime problem as (b). The cost is disk space: the unpacked copy sits next to the original file in `~/apps`.
 - **Review:** `squashfs-tools` is in the image now; older containers get it from apt on first use.
 
 ## H3. Bake certutil (libnss3-tools) into the image
